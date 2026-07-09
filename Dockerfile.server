@@ -1,0 +1,12 @@
+FROM node:20-alpine
+WORKDIR /app
+
+# Install dependencies and copy source
+COPY package.json package-lock.json* ./
+COPY . .
+
+RUN npm ci --production
+
+EXPOSE 4000
+
+CMD ["npm", "start"]
