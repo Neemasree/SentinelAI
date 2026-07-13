@@ -46,8 +46,7 @@ export class DatabaseGatewayStore {
     page?: number;
     pageSize?: number;
   }): Promise<{ rows: RequestLog[]; total: number }> {
-    const page = Math.max(1, filters.page ?? 1);
-    const pageSize = Math.min(100, Math.max(10, filters.pageSize ?? 50));
+    const pageSize = Math.min(500, Math.max(10, filters.pageSize ?? 50));
     const where: Record<string, unknown> = {};
 
     if (filters.userId) where.apiKey = { userId: filters.userId };
@@ -69,7 +68,6 @@ export class DatabaseGatewayStore {
       db.requestLog.findMany({
         where,
         orderBy: { timestamp: "desc" },
-        skip: (page - 1) * pageSize,
         take: pageSize,
         include: { apiKey: true }
       }),
@@ -151,6 +149,7 @@ export class DatabaseGatewayStore {
    */
   async logRequest(req: {
     apiKeyId: string;
+    apiKeyString: string;
     service: ServiceName;
     endpoint: string;
     method: string;
@@ -175,7 +174,7 @@ export class DatabaseGatewayStore {
     return {
       id: log.id,
       timestamp: log.timestamp.getTime(),
-      apiKey: req.client,
+      apiKey: req.apiKeyString,
       client: req.client,
       service: log.service as ServiceName,
       endpoint: log.endpoint,

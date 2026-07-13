@@ -173,9 +173,9 @@ npm start          # run backend with tsx
 - Persist request logs, forecast records, adjustments, incidents, and API keys in PostgreSQL.
 - Add JWT login and RBAC for dashboard users.
 - Add Prometheus metrics and Grafana dashboards.
-- Add Docker Compose for Redis, Postgres, backend, and frontend.
 - Split frontend routes with lazy loading if bundle size matters.
 - Add unit tests for rate limiting, circuit breaker transitions, and forecast decisions.
+
 
 ## License
 

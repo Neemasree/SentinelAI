@@ -161,7 +161,7 @@ async function gatewayRequest(apiKey: string, service: ServiceName, details?: { 
   if (dbAllowed) {
     const dbKey = await dbStore.getApiKeyWithUser(apiKey);
     if (dbKey) {
-      void dbStore.logRequest({ apiKeyId: dbKey.id, service, endpoint, method, status, latencyMs, ip, client: apiKey });
+      void dbStore.logRequest({ apiKeyId: dbKey.id, apiKeyString: apiKey, service, endpoint, method, status, latencyMs, ip, client: apiKey });
     }
   }
 

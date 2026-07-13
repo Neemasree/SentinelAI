@@ -1,3 +1,4 @@
+
 node_modules/
 dist/
 .env
@@ -11,3 +12,9 @@ pnpm-debug.log*
 Thumbs.db
 coverage/
 .vite/
+
+# Docker artifacts (optional; removed in this cleanup)
+# docker-compose.yml
+# Dockerfile.client
+# Dockerfile.server
+
