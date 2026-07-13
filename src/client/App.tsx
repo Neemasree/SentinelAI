@@ -106,7 +106,7 @@ export function App() {
   const [snapshot, setSnapshot] = useState<DashboardSnapshot>(emptySnapshot);
   const [page, setPage] = useState<Page>("overview");
   const [selectedService, setSelectedService] = useState<ServiceName>("orders");
-  const [logQuery, setLogQuery] = useState("");
+  const [wsConnected, setWsConnected] = useState(false);
 
   useEffect(() => {
     fetch("/api/snapshot", { headers: authHeaders(token) })
@@ -119,6 +119,9 @@ export function App() {
     const protocol = window.location.protocol === "https:" ? "wss" : "ws";
     const socket = new WebSocket(`${protocol}://${window.location.hostname}:4000`);
 
+    socket.onopen = () => setWsConnected(true);
+    socket.onclose = () => setWsConnected(false);
+    socket.onerror = () => setWsConnected(false);
     socket.onmessage = (message) => {
       try {
         const event = JSON.parse(message.data) as SocketEvent;
@@ -150,14 +153,6 @@ export function App() {
     const entries = Object.entries(snapshot.rateSeries).filter(([key]) => key.endsWith(`:${selectedService}`));
     return mergeSeries(entries);
   }, [snapshot.rateSeries, selectedService]);
-
-  const logs = useMemo(() => {
-    const q = logQuery.trim().toLowerCase();
-    if (!q) return snapshot.recentLogs;
-    return snapshot.recentLogs.filter((log) =>
-      [log.apiKey, log.client, log.endpoint, log.method, log.service, String(log.status)].some((value) => value.toLowerCase().includes(q))
-    );
-  }, [logQuery, snapshot.recentLogs]);
 
   return (
     <main className="console">
@@ -192,9 +187,9 @@ export function App() {
                 Reset demo
               </button>
             )}
-            <div className="livePill">
+            <div className={`livePill ${wsConnected ? "" : "disconnected"}`}>
               <RadioTower size={16} />
-              live websocket
+              {wsConnected ? "live websocket" : "reconnecting..."}
             </div>
           </div>
         </header>
@@ -203,7 +198,7 @@ export function App() {
           <OverviewPage snapshot={snapshot} selectedService={selectedService} setSelectedService={setSelectedService} selectedSeries={selectedSeries} />
         )}
         {page === "keys" && <KeysPage token={token} />}
-        {page === "logs" && <LogsPage logs={logs} logQuery={logQuery} setLogQuery={setLogQuery} token={token} />}
+        {page === "logs" && <LogsPage token={token} />}
         {page === "predictions" && <PredictionsPage forecasts={snapshot.forecasts} selectedSeries={selectedSeries} />}
         {page === "incidents" && <IncidentsPage adjustments={snapshot.adjustments} incidents={snapshot.incidents} />}
         {page === "chaos" && <ChaosPage snapshot={snapshot} token={token} />}
@@ -274,22 +269,21 @@ function OverviewPage({
 }
 
 function KeysPage({ token }: { token: string | null }) {
+  const { user } = useAuth();
+  const isAdmin = user?.role === "ADMIN";
   const [name, setName] = useState("New Interview Client");
   const [keys, setKeys] = useState<ApiKeyRecord[]>([]);
+  const [newKeyFull, setNewKeyFull] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
 
-  useEffect(() => {
-    void refreshKeys();
-  }, [token]);
+  useEffect(() => { void refreshKeys(); }, [token]);
 
   async function refreshKeys() {
     setLoading(true);
     try {
-      const response = await fetch("/api-keys", { headers: authHeaders(token) });
-      if (response.ok) {
-        const data = (await response.json()) as ApiKeyRecord[];
-        setKeys(data);
-      }
+      const endpoint = isAdmin ? "/api/keys" : "/api-keys";
+      const response = await fetch(endpoint, { headers: authHeaders(token) });
+      if (response.ok) setKeys((await response.json()) as ApiKeyRecord[]);
     } finally {
       setLoading(false);
     }
@@ -297,18 +291,25 @@ function KeysPage({ token }: { token: string | null }) {
 
   async function createKey() {
     if (!name.trim()) return;
-    await postJson("/api-keys", { name: name.trim() }, "POST", token);
+    const endpoint = isAdmin ? "/api/keys" : "/api-keys";
+    const res = await postJson(endpoint, { name: name.trim() }, "POST", token);
+    if (res.ok) {
+      const created = (await res.json()) as ApiKeyRecord;
+      setNewKeyFull(created.key);
+    }
     setName("");
     await refreshKeys();
   }
 
   async function toggleKey(id: string, enabled: boolean) {
-    await postJson(`/api-keys/${id}`, { enabled: !enabled }, "PATCH", token);
+    const endpoint = isAdmin ? `/api/keys/${id}` : `/api-keys/${id}`;
+    await postJson(endpoint, { enabled: !enabled }, "PATCH", token);
     await refreshKeys();
   }
 
   async function deleteKey(id: string) {
-    await postJson(`/api-keys/${id}`, {}, "DELETE", token);
+    const endpoint = isAdmin ? `/api/keys/${id}` : `/api-keys/${id}`;
+    await postJson(endpoint, {}, "DELETE", token);
     await refreshKeys();
   }
 
@@ -321,6 +322,13 @@ function KeysPage({ token }: { token: string | null }) {
           Create key
         </button>
       </section>
+      {newKeyFull && (
+        <section className="panel" style={{ background: "#0d2a1a", border: "1px solid #22c55e", padding: "12px 16px" }}>
+          <strong style={{ color: "#22c55e" }}>Copy your key now — it won't be shown again:</strong>
+          <code style={{ display: "block", marginTop: 6, wordBreak: "break-all" }}>{newKeyFull}</code>
+          <button className="tinyButton" style={{ marginTop: 8 }} onClick={() => setNewKeyFull(null)} type="button">Dismiss</button>
+        </section>
+      )}
       <section className="panel tablePanel">
         <table>
           <thead>
@@ -367,7 +375,16 @@ function KeysPage({ token }: { token: string | null }) {
   );
 }
 
-function LogsPage({ logs, logQuery, setLogQuery, token }: { logs: RequestLog[]; logQuery: string; setLogQuery: (query: string) => void; token: string | null }) {
+function LogsPage({ token }: { token: string | null }) {
+  const [logs, setLogs] = useState<RequestLog[]>([]);
+  const [logQuery, setLogQuery] = useState("");
+
+  useEffect(() => {
+    fetch(`/api/logs?q=${encodeURIComponent(logQuery)}&pageSize=100`, { headers: authHeaders(token) })
+      .then((r) => r.json())
+      .then((data) => setLogs(data.rows ?? []))
+      .catch(() => undefined);
+  }, [logQuery, token]);
   return (
     <div className="pageGrid">
       <section className="panel actionRow">

@@ -3,11 +3,12 @@ import cors from "cors";
 import express from "express";
 import http from "node:http";
 import { WebSocketServer } from "ws";
-import type { ApiKeyRecord, DashboardSnapshot, Incident, ServiceName, ServiceStatus, SocketEvent } from "../shared/types";
+import type { ApiKeyRecord, DashboardSnapshot, Incident, RequestLog, ServiceName, ServiceStatus, SocketEvent } from "../shared/types";
 import { CircuitBreaker } from "./circuitBreaker";
 import { explainIncident, streamText } from "./explanation";
 import { Forecaster } from "./forecaster";
 import { GatewayStore } from "./stores";
+import { DatabaseGatewayStore } from "./dbStore";
 import { authMiddleware, optionalAuthMiddleware, requireAdmin } from "./middleware/auth";
 import authRoutes from "./authRoutes";
 import apiKeyRoutes from "./apiKeyRoutes";
@@ -21,14 +22,15 @@ const app = express();
 const server = http.createServer(app);
 const wss = new WebSocketServer({ server });
 const store = new GatewayStore();
+const dbStore = new DatabaseGatewayStore();
 const breakers = new Map(SERVICES.map((service) => [service, new CircuitBreaker(service)]));
 
-let rampTimer: NodeJS.Timeout | null = null;
+let rampTimer: ReturnType<typeof setInterval> | null = null;
 let rampLevel = 0;
 let incidentActive = false;
 let incidentService: ServiceName = "orders";
 let highLatencyActive = false;
-let backgroundTimer: NodeJS.Timeout | null = null;
+let backgroundTimer: ReturnType<typeof setInterval> | null = null;
 
 // Prometheus metrics
 client.collectDefaultMetrics();
@@ -73,7 +75,7 @@ function servicesSnapshot(): ServiceStatus[] {
       name,
       state: breaker.state,
       failureRate: breaker.failureRate(),
-      currentLimit: store.getCurrentLimit("acme")
+      currentLimit: store.getCurrentLimit(store.listApiKeys()[0]?.key ?? "acme")
     };
   });
 }
@@ -115,105 +117,68 @@ async function gatewayRequest(apiKey: string, service: ServiceName, details?: { 
   const endpoint = details?.endpoint ?? `/${service}`;
   const method = details?.method ?? "GET";
   const ip = details?.ip ?? "127.0.0.1";
-  const client = apiKey;
 
-  if (!store.isApiKeyAllowed(apiKey)) {
-    const entry = store.logRequest({
-      apiKey,
-      client,
-      service,
-      endpoint,
-      method,
-      status: 401,
-      latencyMs: Date.now() - startedAt,
-      ip
-    });
+  // Check key allowed — DB first, fall back to in-memory for demo keys
+  const dbAllowed = await dbStore.isApiKeyAllowed(apiKey);
+  const memAllowed = store.isApiKeyAllowed(apiKey);
+  if (!dbAllowed && !memAllowed) {
+    const entry = store.logRequest({ apiKey, client: apiKey, service, endpoint, method, status: 401, latencyMs: Date.now() - startedAt, ip });
     broadcast({ type: "request-log", payload: entry });
-    try {
-      requestCounter.inc({ service, status: "401" }, 1);
-      requestDuration.observe({ service, status: "401" }, (Date.now() - startedAt) / 1000);
-    } catch {}
+    try { requestCounter.inc({ service, status: "401" }, 1); } catch {}
     return { status: 401, body: { error: "API key disabled or unauthorized" } };
   }
 
-  const limiter = store.consumeToken(apiKey);
+  // Token bucket — Redis for DB keys, in-memory for demo keys
+  const limiter = dbAllowed
+    ? await dbStore.consumeToken(apiKey)
+    : store.consumeToken(apiKey);
+
   if (!limiter.allowed) {
-    const entry = store.logRequest({
-      apiKey,
-      client,
-      service,
-      endpoint,
-      method,
-      status: 429,
-      latencyMs: Date.now() - startedAt,
-      ip
-    });
+    const entry = store.logRequest({ apiKey, client: apiKey, service, endpoint, method, status: 429, latencyMs: Date.now() - startedAt, ip });
     broadcast({ type: "request-log", payload: entry });
-    try {
-      requestCounter.inc({ service, status: "429" }, 1);
-      requestDuration.observe({ service, status: "429" }, (Date.now() - startedAt) / 1000);
-    } catch {}
+    try { requestCounter.inc({ service, status: "429" }, 1); } catch {}
     return { status: 429, body: { error: "Rate limit exceeded", limit: limiter.capacity } };
   }
 
   const breaker = breakers.get(service)!;
   if (!breaker.canRequest()) {
-    const entry = store.logRequest({
-      apiKey,
-      client,
-      service,
-      endpoint,
-      method,
-      status: 503,
-      latencyMs: Date.now() - startedAt,
-      ip
-    });
+    const entry = store.logRequest({ apiKey, client: apiKey, service, endpoint, method, status: 503, latencyMs: Date.now() - startedAt, ip });
     broadcast({ type: "request-log", payload: entry });
-    try {
-      requestCounter.inc({ service, status: "503" }, 1);
-      requestDuration.observe({ service, status: "503" }, (Date.now() - startedAt) / 1000);
-    } catch {}
+    try { requestCounter.inc({ service, status: "503" }, 1); } catch {}
     return { status: 503, body: { error: "Circuit open", service } };
   }
 
   const success = await callDownstream(service);
   breaker.recordResult(success);
   const status = success ? 200 : 502;
-  const entry = store.logRequest({
-    apiKey,
-    client,
-    service,
-    endpoint,
-    method,
-    status,
-    latencyMs: Date.now() - startedAt,
-    ip
-  });
+  const latencyMs = Date.now() - startedAt;
+
+  // Log to in-memory store for real-time WS feed
+  const entry = store.logRequest({ apiKey, client: apiKey, service, endpoint, method, status, latencyMs, ip });
   broadcast({ type: "request-log", payload: entry });
+
+  // Also persist to Postgres for DB-backed keys
+  if (dbAllowed) {
+    const dbKey = await dbStore.getApiKeyWithUser(apiKey);
+    if (dbKey) {
+      void dbStore.logRequest({ apiKeyId: dbKey.id, service, endpoint, method, status, latencyMs, ip, client: apiKey });
+    }
+  }
 
   try {
     requestCounter.inc({ service, status: String(status) }, 1);
-    requestDuration.observe({ service, status: String(status) }, (Date.now() - startedAt) / 1000);
+    requestDuration.observe({ service, status: String(status) }, latencyMs / 1000);
   } catch {}
 
   if (!success && incidentActive) {
     maybeCreateIncident(apiKey, service, breaker.failureRate());
     return { status: 502, body: { error: "Downstream failure", service } };
   }
-
-  if (!success) {
-    return { status: 502, body: { error: "Downstream failure", service } };
-  }
+  if (!success) return { status: 502, body: { error: "Downstream failure", service } };
 
   return {
     status: 200,
-    body: {
-      ok: true,
-      service,
-      client: apiKey,
-      traceId: crypto.randomUUID(),
-      remainingEstimate: Math.round(limiter.tokens)
-    }
+    body: { ok: true, service, client: apiKey, traceId: crypto.randomUUID(), remainingEstimate: Math.round(limiter.tokens) }
   };
 }
 
@@ -245,14 +210,17 @@ function maybeCreateIncident(apiKey: string, service: ServiceName, failureRate: 
   );
 }
 
+const userSnapshotCache = new Map<string, { data: DashboardSnapshot; expiresAt: number }>();
+
 app.get("/api/snapshot", optionalAuthMiddleware, async (req, res) => {
-  if (!req.user) {
+  if (!req.user || req.user.role === "ADMIN") {
     res.json(snapshot());
     return;
   }
 
-  if (req.user.role === "ADMIN") {
-    res.json(snapshot());
+  const cached = userSnapshotCache.get(req.user.userId);
+  if (cached && cached.expiresAt > Date.now()) {
+    res.json(cached.data);
     return;
   }
 
@@ -271,8 +239,9 @@ app.get("/api/snapshot", optionalAuthMiddleware, async (req, res) => {
     remainingTokens: key.remainingTokens
   }));
   const rawKeyStrings = apiKeys.map(k => k.key);
-
-  res.json(snapshot(apiKeys, rawKeyStrings));
+  const data = snapshot(apiKeys, rawKeyStrings);
+  userSnapshotCache.set(req.user.userId, { data, expiresAt: Date.now() + 2000 });
+  res.json(data);
 });
 
 app.get("/api/keys", authMiddleware, requireAdmin, (_req, res) => {
@@ -304,25 +273,40 @@ app.delete("/api/keys/:id", authMiddleware, requireAdmin, (req, res) => {
 });
 
 app.get("/api/logs", optionalAuthMiddleware, async (req, res) => {
-  let allowedApiKeys: string[] | undefined = undefined;
+  const filters = {
+    q: String(req.query.q ?? ""),
+    status: req.query.status ? String(req.query.status) : undefined,
+    service: req.query.service ? String(req.query.service) : undefined,
+    apiKey: req.query.apiKey ? String(req.query.apiKey) : undefined,
+    page: Number(req.query.page ?? 1),
+    pageSize: Number(req.query.pageSize ?? 50)
+  };
 
+  // Fetch a raw window from both sources (no pagination yet), then merge
+  let allowedApiKeys: string[] | undefined = undefined;
   if (req.user && req.user.role !== "ADMIN") {
     const { db } = await import("./db");
     const dbKeys = await db.apiKey.findMany({ where: { userId: req.user.userId }, select: { key: true } });
-    allowedApiKeys = dbKeys.map((key) => key.key);
+    allowedApiKeys = dbKeys.map((k) => k.key);
   }
+  const memResult = store.queryLogs({ ...filters, page: 1, pageSize: 500, allowedApiKeys });
+  const dbUserId = req.user?.role !== "ADMIN" ? req.user?.userId : undefined;
+  const dbResult = await dbStore.queryLogs({ ...filters, page: 1, pageSize: 500, userId: dbUserId });
 
-  res.json(
-    store.queryLogs({
-      q: String(req.query.q ?? ""),
-      status: req.query.status ? String(req.query.status) : undefined,
-      service: req.query.service ? String(req.query.service) : undefined,
-      apiKey: req.query.apiKey ? String(req.query.apiKey) : undefined,
-      page: Number(req.query.page ?? 1),
-      pageSize: Number(req.query.pageSize ?? 50),
-      allowedApiKeys
-    })
-  );
+  // Merge, deduplicate by id, sort descending, then paginate
+  const seen = new Set<string>();
+  const merged: RequestLog[] = [];
+  for (const row of [...memResult.rows, ...dbResult.rows]) {
+    if (!seen.has(row.id)) { seen.add(row.id); merged.push(row); }
+  }
+  merged.sort((a, b) => b.timestamp - a.timestamp);
+  const { page, pageSize } = filters;
+  res.json({
+    rows: merged.slice((page - 1) * pageSize, page * pageSize),
+    total: merged.length,
+    page,
+    pageSize
+  });
 });
 
 app.get("/api/logs.csv", optionalAuthMiddleware, async (req, res) => {
@@ -330,21 +314,35 @@ app.get("/api/logs.csv", optionalAuthMiddleware, async (req, res) => {
   if (!userPayload && req.query.token) {
     const { verifyToken } = await import("./auth");
     const payload = verifyToken(String(req.query.token));
-    if (payload) {
-      userPayload = payload;
-    }
+    if (payload) userPayload = payload;
   }
 
   let allowedApiKeys: string[] | undefined = undefined;
+  let dbUserId: string | undefined = undefined;
   if (userPayload && userPayload.role !== "ADMIN") {
     const { db } = await import("./db");
     const dbKeys = await db.apiKey.findMany({ where: { userId: userPayload.userId }, select: { key: true } });
-    allowedApiKeys = dbKeys.map(k => k.key);
+    allowedApiKeys = dbKeys.map((k) => k.key);
+    dbUserId = userPayload.userId;
   }
+
+  const memLogs = store.csvRows(allowedApiKeys);
+  const dbResult = await dbStore.queryLogs({ page: 1, pageSize: 5000, userId: dbUserId });
+
+  const seen = new Set<string>(memLogs.map((r) => r.id));
+  const allRows = [
+    ...memLogs,
+    ...dbResult.rows.filter((r) => !seen.has(r.id))
+  ].sort((a, b) => b.timestamp - a.timestamp);
+
+  const header = "timestamp,client,apiKey,method,endpoint,service,status,latencyMs,ip";
+  const csv = [header, ...allRows.map((log) =>
+    [new Date(log.timestamp).toISOString(), log.client, log.apiKey, log.method, log.endpoint, log.service, log.status, log.latencyMs, log.ip].join(",")
+  )].join("\n");
 
   res.header("content-type", "text/csv");
   res.attachment("gateway-logs.csv");
-  res.send(store.csvLogs(allowedApiKeys));
+  res.send(csv);
 });
 
 app.get("/api/forecasts", optionalAuthMiddleware, async (req, res) => {
@@ -373,7 +371,7 @@ app.get("/api/analytics", optionalAuthMiddleware, async (req, res) => {
   res.json(store.analytics(allowedApiKeys));
 });
 
-app.get("/api/settings", (_req, res) => {
+app.get("/api/settings", optionalAuthMiddleware, (_req, res) => {
   res.json(store.getSettings());
 });
 
@@ -387,6 +385,9 @@ app.patch("/api/settings", authMiddleware, requireAdmin, (req, res) => {
     circuitFailureThreshold: Number(req.body.circuitFailureThreshold ?? store.getSettings().circuitFailureThreshold),
     circuitCooldownSeconds: Number(req.body.circuitCooldownSeconds ?? store.getSettings().circuitCooldownSeconds)
   });
+  for (const breaker of breakers.values()) {
+    breaker.updateOptions(settings.circuitFailureThreshold, settings.circuitCooldownSeconds);
+  }
   broadcast({ type: "settings", payload: settings });
   res.json(settings);
 });
@@ -417,7 +418,11 @@ app.get("/gateway/:service/*?", async (req, res) => {
     return;
   }
 
-  const apiKey = String(req.header("x-api-key") ?? req.query.apiKey ?? "acme");
+  const apiKey = req.header("x-api-key") ?? String(req.query.apiKey ?? "");
+  if (!apiKey) {
+    res.status(401).json({ error: "Missing x-api-key header" });
+    return;
+  }
   const result = await gatewayRequest(apiKey, service, {
     endpoint: req.originalUrl,
     method: req.method,
@@ -516,6 +521,13 @@ setInterval(() => {
   forecaster.run();
   broadcast({ type: "snapshot", payload: snapshot() });
 }, 1_000);
+
+setInterval(() => {
+  const now = Date.now();
+  for (const [key, val] of userSnapshotCache.entries()) {
+    if (val.expiresAt < now) userSnapshotCache.delete(key);
+  }
+}, 30_000);
 
 backgroundTimer = setInterval(() => {
   const service = SERVICES[Math.floor(Math.random() * SERVICES.length)];

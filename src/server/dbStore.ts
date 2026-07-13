@@ -1,9 +1,12 @@
 import { db } from "./db";
-import { redis } from "./redis";
+import { redis, redisAvailable } from "./redis";
 import type { ApiKeyRecord, ForecastRecord, Incident, PredictiveAdjustment, RequestLog, ServiceName, GatewaySettings, AnalyticsSummary, RatePoint } from "../shared/types";
 
 type Bucket = { tokens: number; lastRefill: number };
 type Override = { limit: number; expiresAt: number };
+
+// In-memory fallback buckets when Redis is unavailable
+const memBuckets = new Map<string, Bucket>();
 
 export class DatabaseGatewayStore {
   private defaultSettings: GatewaySettings = {
@@ -32,6 +35,65 @@ export class DatabaseGatewayStore {
   }
 
   /**
+   * Query logs from Postgres with the same filter shape as GatewayStore.queryLogs
+   */
+  async queryLogs(filters: {
+    q?: string;
+    status?: string;
+    service?: string;
+    apiKey?: string;
+    userId?: string;   // if set, scope to this user's keys only
+    page?: number;
+    pageSize?: number;
+  }): Promise<{ rows: RequestLog[]; total: number }> {
+    const page = Math.max(1, filters.page ?? 1);
+    const pageSize = Math.min(100, Math.max(10, filters.pageSize ?? 50));
+    const where: Record<string, unknown> = {};
+
+    if (filters.userId) where.apiKey = { userId: filters.userId };
+    if (filters.status) where.status = Number(filters.status);
+    if (filters.service) where.service = filters.service;
+    if (filters.apiKey) where.apiKey = { ...((where.apiKey as object) ?? {}), key: filters.apiKey };
+    if (filters.q) {
+      const q = filters.q.toLowerCase();
+      where.OR = [
+        { service: { contains: q, mode: "insensitive" } },
+        { endpoint: { contains: q, mode: "insensitive" } },
+        { method: { contains: q, mode: "insensitive" } },
+        { client: { contains: q, mode: "insensitive" } },
+        { ip: { contains: q, mode: "insensitive" } }
+      ];
+    }
+
+    const [records, total] = await Promise.all([
+      db.requestLog.findMany({
+        where,
+        orderBy: { timestamp: "desc" },
+        skip: (page - 1) * pageSize,
+        take: pageSize,
+        include: { apiKey: true }
+      }),
+      db.requestLog.count({ where })
+    ]);
+
+    return {
+      rows: records.map((r) => ({
+        id: r.id,
+        timestamp: r.timestamp.getTime(),
+        apiKey: r.apiKey.key,
+        client: r.client,
+        service: r.service as ServiceName,
+        endpoint: r.endpoint,
+        method: r.method,
+        status: r.status,
+        latencyMs: r.latencyMs,
+        ip: r.ip
+      })),
+      total
+    };
+  }
+
+  /**
    * Get API key with user info
    */
   async getApiKeyWithUser(apiKeyString: string) {
@@ -46,42 +108,41 @@ export class DatabaseGatewayStore {
    */
   async consumeToken(apiKeyString: string): Promise<{ allowed: boolean; tokens: number; capacity: number }> {
     const capacity = this.defaultSettings.defaultLimit;
-    const redisKey = `rate:${apiKeyString}`;
     const now = Date.now();
 
-    // Get current bucket from Redis
-    const bucketJson = await redis.get(redisKey);
-    let bucket: Bucket = bucketJson ? JSON.parse(bucketJson) : { tokens: capacity, lastRefill: now };
+    let bucket: Bucket;
 
-    // Refill tokens based on time elapsed
-    const elapsedSeconds = (now - bucket.lastRefill) / 1000;
-    const refillRate = capacity / 60; // tokens per second
-    bucket.tokens = Math.min(capacity, bucket.tokens + elapsedSeconds * refillRate);
+    if (redisAvailable.available) {
+      try {
+        const redisKey = `rate:${apiKeyString}`;
+        const bucketJson = await redis.get(redisKey);
+        bucket = bucketJson ? JSON.parse(bucketJson) : { tokens: capacity, lastRefill: now };
+        const elapsed = (now - bucket.lastRefill) / 1000;
+        bucket.tokens = Math.min(capacity, bucket.tokens + elapsed * (capacity / 60));
+        bucket.lastRefill = now;
+        const allowed = bucket.tokens >= 1;
+        if (allowed) bucket.tokens -= 1;
+        await redis.setex(redisKey, 3600, JSON.stringify(bucket));
+        try {
+          await db.apiKey.update({
+            where: { key: apiKeyString },
+            data: { usageCount: { increment: 1 }, lastUsedAt: new Date(), remainingTokens: Math.round(bucket.tokens) }
+          });
+        } catch {}
+        return { allowed, tokens: bucket.tokens, capacity };
+      } catch {
+        // Redis failed mid-request, fall through to memory
+      }
+    }
+
+    // In-memory fallback
+    bucket = memBuckets.get(apiKeyString) ?? { tokens: capacity, lastRefill: now };
+    const elapsed = (now - bucket.lastRefill) / 1000;
+    bucket.tokens = Math.min(capacity, bucket.tokens + elapsed * (capacity / 60));
     bucket.lastRefill = now;
-
-    // Try to consume 1 token
     const allowed = bucket.tokens >= 1;
-    if (allowed) {
-      bucket.tokens -= 1;
-    }
-
-    // Save back to Redis
-    await redis.setex(redisKey, 3600, JSON.stringify(bucket));
-
-    // Update DB usage count
-    try {
-      await db.apiKey.update({
-        where: { key: apiKeyString },
-        data: {
-          usageCount: { increment: 1 },
-          lastUsedAt: new Date(),
-          remainingTokens: Math.round(bucket.tokens)
-        }
-      });
-    } catch {
-      // Ignore if key doesn't exist
-    }
-
+    if (allowed) bucket.tokens -= 1;
+    memBuckets.set(apiKeyString, bucket);
     return { allowed, tokens: bucket.tokens, capacity };
   }
 
@@ -158,29 +219,29 @@ export class DatabaseGatewayStore {
    * Push rate point for forecasting
    */
   async pushRatePoint(userId: string, service: ServiceName, point: RatePoint): Promise<void> {
-    const redisKey = `rate-series:${userId}:${service}`;
-    const series = await redis.lrange(redisKey, 0, -1);
-    const points: RatePoint[] = series.map((s) => JSON.parse(s));
-    points.push(point);
-
-    // Keep last 100 points
-    if (points.length > 100) points.shift();
-
-    // Update Redis
-    await redis.del(redisKey);
-    for (const p of points) {
-      await redis.rpush(redisKey, JSON.stringify(p));
-    }
-    await redis.expire(redisKey, 3600);
+    if (!redisAvailable.available) return;
+    try {
+      const redisKey = `rate-series:${userId}:${service}`;
+      const series = await redis.lrange(redisKey, 0, -1);
+      const points: RatePoint[] = series.map((s) => JSON.parse(s));
+      points.push(point);
+      if (points.length > 100) points.shift();
+      await redis.del(redisKey);
+      for (const p of points) await redis.rpush(redisKey, JSON.stringify(p));
+      await redis.expire(redisKey, 3600);
+    } catch {}
   }
 
   /**
    * Get recent rate points
    */
   async recentRatePoints(userId: string, service: ServiceName): Promise<RatePoint[]> {
-    const redisKey = `rate-series:${userId}:${service}`;
-    const series = await redis.lrange(redisKey, 0, -1);
-    return series.map((s) => JSON.parse(s) as RatePoint);
+    if (!redisAvailable.available) return [];
+    try {
+      const redisKey = `rate-series:${userId}:${service}`;
+      const series = await redis.lrange(redisKey, 0, -1);
+      return series.map((s) => JSON.parse(s) as RatePoint);
+    } catch { return []; }
   }
 
   /**
@@ -208,7 +269,7 @@ export class DatabaseGatewayStore {
     return {
       id: forecast.id,
       timestamp: forecast.timestamp.getTime(),
-      apiKey: "", // Will be populated from context
+      apiKey: req.apiKeyId,
       service: forecast.service as ServiceName,
       currentRate: forecast.currentRate,
       predictedRate: forecast.predictedRate,
@@ -270,7 +331,7 @@ export class DatabaseGatewayStore {
 
     return {
       id: adjustment.id,
-      apiKey: "", // Will be populated from context
+      apiKey: req.apiKeyId,
       service: adjustment.service as ServiceName,
       oldLimit: adjustment.oldLimit,
       newLimit: adjustment.newLimit,
@@ -332,7 +393,7 @@ export class DatabaseGatewayStore {
     return {
       id: incident.id,
       service: incident.service as ServiceName,
-      apiKey: "", // Will be populated from context
+      apiKey: req.apiKeyId,
       failureRate: incident.failureRate,
       timestamp: incident.timestamp.getTime(),
       explanation: incident.explanation || "",

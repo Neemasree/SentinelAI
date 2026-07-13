@@ -35,7 +35,7 @@ export function Register({ onRegisterSuccess, onSwitchToLogin }: Props) {
 
     try {
       const req: RegisterRequest = { email, password, name };
-      const response = await fetch("http://127.0.0.1:4000/auth/register", {
+      const response = await fetch("/auth/register", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(req)

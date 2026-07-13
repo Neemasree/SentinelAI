@@ -140,7 +140,7 @@ export class GatewayStore {
 
   isApiKeyAllowed(apiKey: string) {
     const record = this.apiKeys.find((key) => key.key === apiKey);
-    return !record || record.enabled;
+    return record?.enabled === true;
   }
 
   getCurrentLimit(apiKey: string) {
@@ -345,6 +345,12 @@ export class GatewayStore {
       byStatus,
       peakHours
     };
+  }
+
+  csvRows(allowedApiKeys?: string[]): RequestLog[] {
+    return allowedApiKeys
+      ? this.requestLog.filter((log) => allowedApiKeys.includes(log.apiKey))
+      : this.requestLog;
   }
 
   csvLogs(allowedApiKeys?: string[]) {

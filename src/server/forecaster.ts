@@ -49,11 +49,21 @@ export class Forecaster {
     const settings = this.store.getSettings();
     const points = this.store.recentRatePoints(apiKey, service);
     const trend = computeTrend(points);
+    const useful = points.filter((p) => Number.isFinite(p.rate));
+    const n = useful.length;
     const nowSeconds = Math.round(Date.now() / 1000);
     const latest = points.at(-1);
     if (!latest) return;
 
-    const confidence = trend ? Math.max(0.45, Math.min(0.98, 1 - Math.abs(trend.slope) * 1.2)) : undefined;
+    const confidence = trend
+      ? (() => {
+          const meanR = useful.reduce((s, p) => s + p.rate, 0) / n;
+          const ssTot = useful.reduce((s, p) => s + (p.rate - meanR) ** 2, 0);
+          const ssRes = useful.reduce((s, p) => s + (p.rate - trend.predict(p.t)) ** 2, 0);
+          const r2 = ssTot === 0 ? 0 : Math.max(0, 1 - ssRes / ssTot);
+          return Math.max(0.3, Math.min(0.98, r2 * (Math.min(n, 20) / 20)));
+        })()
+      : undefined;
     const forecast = trend?.predict(nowSeconds + settings.predictionHorizonSeconds);
     const point: RatePoint = { t: nowSeconds, rate: latest.rate, forecast, confidence };
     this.store.pushRatePoint(key, point);

@@ -7,12 +7,16 @@ export class CircuitBreaker {
 
   constructor(
     public readonly serviceName: string,
-    private readonly options = {
+    private options = {
       failureThreshold: 0.5,
       windowMs: 10_000,
       cooldownMs: 15_000
     }
   ) {}
+
+  updateOptions(failureThreshold: number, cooldownSeconds: number) {
+    this.options = { ...this.options, failureThreshold, cooldownMs: cooldownSeconds * 1000 };
+  }
 
   recordResult(success: boolean) {
     const now = Date.now();

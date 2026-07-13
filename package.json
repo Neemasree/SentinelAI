@@ -4,7 +4,7 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "dev": "concurrently \"npm:db:push\" \"npm:dev:server\" \"npm:dev:client\"",
+    "dev": "npm run db:push && concurrently \"npm:dev:server\" \"npm:dev:client\"",
     "dev:server": "tsx watch src/server/index.ts",
     "dev:client": "vite --host 127.0.0.1",
     "build": "tsc && vite build",
@@ -12,7 +12,11 @@
     "typecheck": "tsc --noEmit",
     "db:push": "prisma db push --skip-generate",
     "db:studio": "prisma studio",
-    "db:migrate": "prisma migrate dev"
+    "db:migrate": "prisma migrate dev",
+    "db:seed": "tsx prisma/seed.ts"
+  },
+  "prisma": {
+    "seed": "tsx prisma/seed.ts"
   },
   "dependencies": {
     "@prisma/client": "^5.8.0",

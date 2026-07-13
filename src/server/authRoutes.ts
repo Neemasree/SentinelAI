@@ -7,6 +7,20 @@ import type { UserRecord, LoginRequest, RegisterRequest } from "../shared/types"
 
 const router = express.Router();
 
+// Simple in-memory login rate limiter
+const loginAttempts = new Map<string, { count: number; resetAt: number }>();
+function checkLoginRateLimit(ip: string): boolean {
+  const now = Date.now();
+  const entry = loginAttempts.get(ip);
+  if (!entry || entry.resetAt < now) {
+    loginAttempts.set(ip, { count: 1, resetAt: now + 60_000 });
+    return true;
+  }
+  if (entry.count >= 10) return false;
+  entry.count++;
+  return true;
+}
+
 function userToRecord(user: any): UserRecord {
   return {
     id: user.id,
@@ -67,6 +81,11 @@ router.post("/login", async (req: Request<{}, {}, LoginRequest>, res: Response) 
 
     if (!email || !password) {
       return res.status(400).json({ error: "Missing email or password" });
+    }
+
+    const ip = req.ip ?? "unknown";
+    if (!checkLoginRateLimit(ip)) {
+      return res.status(429).json({ error: "Too many login attempts. Try again in a minute." });
     }
 
     // Find user

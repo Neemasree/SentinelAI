@@ -12,12 +12,16 @@ function generateApiKey(): string {
   return `sk_${crypto.randomBytes(24).toString("hex")}`;
 }
 
-function keyToRecord(key: any): ApiKeyRecord {
+function maskKey(key: string): string {
+  return key.length > 12 ? `${key.slice(0, 8)}...${key.slice(-4)}` : key;
+}
+
+function keyToRecord(key: any, showFull = false): ApiKeyRecord {
   return {
     id: key.id,
     name: key.name,
-    key: key.key,
-    role: key.enabled ? "client" : "client", // All user-created keys are clients
+    key: showFull ? key.key : maskKey(key.key),
+    role: "client",
     enabled: key.enabled,
     createdAt: key.createdAt.getTime(),
     lastUsedAt: key.lastUsedAt?.getTime(),
@@ -66,7 +70,7 @@ router.post("/", authMiddleware, async (req: Request, res: Response) => {
       }
     });
 
-    return res.status(201).json(keyToRecord(key));
+    return res.status(201).json(keyToRecord(key, true));
   } catch (error) {
     console.error("Create API key error:", error);
     return res.status(500).json({ error: "Failed to create API key" });
@@ -162,7 +166,7 @@ router.delete("/:id", authMiddleware, async (req: Request, res: Response) => {
       where: { id: String(req.params.id) }
     });
 
-    return res.json({ message: "API key deleted" });
+    return res.status(204).end();
   } catch (error) {
     console.error("Delete API key error:", error);
     return res.status(500).json({ error: "Failed to delete API key" });

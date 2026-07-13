@@ -1,10 +1,8 @@
 import { PrismaClient } from "@prisma/client";
 import bcryptjs from "bcryptjs";
+import { config } from "dotenv";
 
-declare const process: {
-  env: Record<string, string | undefined>;
-  exit: (code?: number) => void;
-};
+config();
 
 const prisma = new PrismaClient();
 
@@ -62,8 +60,7 @@ main()
   .catch(async (e) => {
     console.error(e);
     await prisma.$disconnect();
-    // In environments where `process.exit` types are not available, just let the process end.
-    (process as any).exit?.(1);
+    process.exit(1);
   });
 
 

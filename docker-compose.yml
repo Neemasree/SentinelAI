@@ -1,4 +1,3 @@
-version: "3.8"
 services:
   gateway:
     build:
@@ -10,34 +9,55 @@ services:
       - PORT=4000
       - NODE_ENV=production
       - REDIS_URL=redis://redis:6379
-      - DATABASE_URL=postgresql://postgres:postgres@postgres:5432/postgres
+      - DATABASE_URL=postgresql://postgres:postgres@postgres:5432/sentinel_ai
+      - JWT_SECRET=${JWT_SECRET:-sentinelai-jwt-secret-change-in-production-min-32-chars}
+      - JWT_EXPIRES_IN=7d
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+      - ANTHROPIC_MODEL=${ANTHROPIC_MODEL:-claude-3-sonnet-20240229}
     depends_on:
-      - redis
-      - postgres
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
 
   client:
     build:
       context: .
       dockerfile: Dockerfile.client
     ports:
-      - "5173:5173"
+      - "5173:80"
     depends_on:
       - gateway
 
   redis:
-    image: redis:7
+    image: redis:7-alpine
     ports:
       - "6379:6379"
+    volumes:
+      - redisdata:/data
+    command: redis-server --appendonly yes
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
 
   postgres:
-    image: postgres:15
+    image: postgres:15-alpine
     environment:
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: sentinel_ai
     ports:
       - "5432:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d sentinel_ai"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
 
   prometheus:
     image: prom/prometheus:latest
@@ -52,8 +72,12 @@ services:
     image: grafana/grafana:latest
     ports:
       - "3000:3000"
+    volumes:
+      - grafanadata:/var/lib/grafana
     depends_on:
       - prometheus
 
 volumes:
   pgdata:
+  redisdata:
+  grafanadata:
