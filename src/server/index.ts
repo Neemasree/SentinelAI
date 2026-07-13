@@ -1,12 +1,16 @@
+import "dotenv/config";
 import cors from "cors";
 import express from "express";
 import http from "node:http";
 import { WebSocketServer } from "ws";
-import type { DashboardSnapshot, Incident, ServiceName, ServiceStatus, SocketEvent } from "../shared/types";
+import type { ApiKeyRecord, DashboardSnapshot, Incident, ServiceName, ServiceStatus, SocketEvent } from "../shared/types";
 import { CircuitBreaker } from "./circuitBreaker";
 import { explainIncident, streamText } from "./explanation";
 import { Forecaster } from "./forecaster";
 import { GatewayStore } from "./stores";
+import { authMiddleware, optionalAuthMiddleware, requireAdmin } from "./middleware/auth";
+import authRoutes from "./authRoutes";
+import apiKeyRoutes from "./apiKeyRoutes";
 import * as client from "prom-client";
 
 const PORT = Number(process.env.PORT ?? 4000);
@@ -52,6 +56,8 @@ app.get("/metrics", async (_req, res) => {
 
 app.use(cors());
 app.use(express.json());
+app.use("/auth", authRoutes);
+app.use("/api-keys", apiKeyRoutes);
 
 function broadcast(event: SocketEvent) {
   const message = JSON.stringify(event);
@@ -72,19 +78,28 @@ function servicesSnapshot(): ServiceStatus[] {
   });
 }
 
-function snapshot(): DashboardSnapshot {
+function snapshot(userApiKeys?: ApiKeyRecord[], rawKeyStrings?: string[]): DashboardSnapshot {
+  const keys = userApiKeys ?? store.listApiKeys();
+  const keySet = new Set(rawKeyStrings ?? keys.map((key) => key.key));
+  const hasKeyFilter = rawKeyStrings !== undefined || userApiKeys !== undefined;
+
   return {
     services: servicesSnapshot(),
-    apiKeys: store.listApiKeys(),
-    recentLogs: store.recentLogs(),
-    forecasts: store.snapshotForecasts(),
+    apiKeys: keys,
+    recentLogs: store.recentLogs().filter((log) => !hasKeyFilter || keySet.has(log.apiKey)),
+    forecasts: store.snapshotForecasts().filter((forecast) => !hasKeyFilter || keySet.has(forecast.apiKey)),
     settings: store.getSettings(),
-    analytics: store.analytics(),
-    rateSeries: store.snapshotSeries(),
-    adjustments: store.snapshotAdjustments(),
-    incidents: store.snapshotIncidents(),
+    analytics: store.analytics(hasKeyFilter ? [...keySet] : undefined),
+    rateSeries: filterRateSeries(store.snapshotSeries(), keySet, hasKeyFilter),
+    adjustments: store.snapshotAdjustments().filter((adjustment) => !hasKeyFilter || keySet.has(adjustment.apiKey)),
+    incidents: store.snapshotIncidents().filter((incident) => !hasKeyFilter || keySet.has(incident.apiKey)),
     chaos: { rampActive: Boolean(rampTimer), incidentActive }
   };
+}
+
+function filterRateSeries(series: Record<string, DashboardSnapshot["rateSeries"][string]>, keySet: Set<string>, hasFilter = true) {
+  if (!hasFilter) return series;
+  return Object.fromEntries(Object.entries(series).filter(([key]) => keySet.has(key.split(":")[0])));
 }
 
 async function callDownstream(service: ServiceName) {
@@ -230,15 +245,41 @@ function maybeCreateIncident(apiKey: string, service: ServiceName, failureRate: 
   );
 }
 
-app.get("/api/snapshot", (_req, res) => {
-  res.json(snapshot());
+app.get("/api/snapshot", optionalAuthMiddleware, async (req, res) => {
+  if (!req.user) {
+    res.json(snapshot());
+    return;
+  }
+
+  if (req.user.role === "ADMIN") {
+    res.json(snapshot());
+    return;
+  }
+
+  const { db } = await import("./db");
+  const dbKeys = await db.apiKey.findMany({ where: { userId: req.user.userId } });
+  const apiKeys: ApiKeyRecord[] = dbKeys.map((key) => ({
+    id: key.id,
+    name: key.name,
+    key: key.key,
+    role: "client",
+    enabled: key.enabled,
+    createdAt: key.createdAt.getTime(),
+    lastUsedAt: key.lastUsedAt?.getTime(),
+    usageCount: key.usageCount,
+    currentLimit: key.currentLimit,
+    remainingTokens: key.remainingTokens
+  }));
+  const rawKeyStrings = apiKeys.map(k => k.key);
+
+  res.json(snapshot(apiKeys, rawKeyStrings));
 });
 
-app.get("/api/keys", (_req, res) => {
+app.get("/api/keys", authMiddleware, requireAdmin, (_req, res) => {
   res.json(store.listApiKeys());
 });
 
-app.post("/api/keys", (req, res) => {
+app.post("/api/keys", authMiddleware, requireAdmin, (req, res) => {
   const name = String(req.body.name ?? "New Client");
   const role = req.body.role === "admin" ? "admin" : "client";
   const record = store.createApiKey(name, role);
@@ -246,8 +287,8 @@ app.post("/api/keys", (req, res) => {
   res.status(201).json(record);
 });
 
-app.patch("/api/keys/:id", (req, res) => {
-  const record = store.updateApiKey(req.params.id, req.body);
+app.patch("/api/keys/:id", authMiddleware, requireAdmin, (req, res) => {
+  const record = store.updateApiKey(String(req.params.id), req.body);
   if (!record) {
     res.status(404).json({ error: "API key not found" });
     return;
@@ -256,13 +297,21 @@ app.patch("/api/keys/:id", (req, res) => {
   res.json(record);
 });
 
-app.delete("/api/keys/:id", (req, res) => {
-  const deleted = store.deleteApiKey(req.params.id);
+app.delete("/api/keys/:id", authMiddleware, requireAdmin, (req, res) => {
+  const deleted = store.deleteApiKey(String(req.params.id));
   broadcast({ type: "api-keys", payload: store.listApiKeys() });
   res.status(deleted ? 204 : 404).end();
 });
 
-app.get("/api/logs", (req, res) => {
+app.get("/api/logs", optionalAuthMiddleware, async (req, res) => {
+  let allowedApiKeys: string[] | undefined = undefined;
+
+  if (req.user && req.user.role !== "ADMIN") {
+    const { db } = await import("./db");
+    const dbKeys = await db.apiKey.findMany({ where: { userId: req.user.userId }, select: { key: true } });
+    allowedApiKeys = dbKeys.map((key) => key.key);
+  }
+
   res.json(
     store.queryLogs({
       q: String(req.query.q ?? ""),
@@ -270,30 +319,65 @@ app.get("/api/logs", (req, res) => {
       service: req.query.service ? String(req.query.service) : undefined,
       apiKey: req.query.apiKey ? String(req.query.apiKey) : undefined,
       page: Number(req.query.page ?? 1),
-      pageSize: Number(req.query.pageSize ?? 50)
+      pageSize: Number(req.query.pageSize ?? 50),
+      allowedApiKeys
     })
   );
 });
 
-app.get("/api/logs.csv", (_req, res) => {
+app.get("/api/logs.csv", optionalAuthMiddleware, async (req, res) => {
+  let userPayload = req.user;
+  if (!userPayload && req.query.token) {
+    const { verifyToken } = await import("./auth");
+    const payload = verifyToken(String(req.query.token));
+    if (payload) {
+      userPayload = payload;
+    }
+  }
+
+  let allowedApiKeys: string[] | undefined = undefined;
+  if (userPayload && userPayload.role !== "ADMIN") {
+    const { db } = await import("./db");
+    const dbKeys = await db.apiKey.findMany({ where: { userId: userPayload.userId }, select: { key: true } });
+    allowedApiKeys = dbKeys.map(k => k.key);
+  }
+
   res.header("content-type", "text/csv");
   res.attachment("gateway-logs.csv");
-  res.send(store.csvLogs());
+  res.send(store.csvLogs(allowedApiKeys));
 });
 
-app.get("/api/forecasts", (_req, res) => {
-  res.json(store.snapshotForecasts());
+app.get("/api/forecasts", optionalAuthMiddleware, async (req, res) => {
+  let allowedApiKeys: string[] | undefined = undefined;
+  if (req.user && req.user.role !== "ADMIN") {
+    const { db } = await import("./db");
+    const dbKeys = await db.apiKey.findMany({ where: { userId: req.user.userId }, select: { key: true } });
+    allowedApiKeys = dbKeys.map((key) => key.key);
+  }
+  const forecasts = store.snapshotForecasts();
+  if (allowedApiKeys) {
+    const keySet = new Set(allowedApiKeys);
+    res.json(forecasts.filter(f => keySet.has(f.apiKey)));
+  } else {
+    res.json(forecasts);
+  }
 });
 
-app.get("/api/analytics", (_req, res) => {
-  res.json(store.analytics());
+app.get("/api/analytics", optionalAuthMiddleware, async (req, res) => {
+  let allowedApiKeys: string[] | undefined = undefined;
+  if (req.user && req.user.role !== "ADMIN") {
+    const { db } = await import("./db");
+    const dbKeys = await db.apiKey.findMany({ where: { userId: req.user.userId }, select: { key: true } });
+    allowedApiKeys = dbKeys.map((key) => key.key);
+  }
+  res.json(store.analytics(allowedApiKeys));
 });
 
 app.get("/api/settings", (_req, res) => {
   res.json(store.getSettings());
 });
 
-app.patch("/api/settings", (req, res) => {
+app.patch("/api/settings", authMiddleware, requireAdmin, (req, res) => {
   const settings = store.updateSettings({
     defaultLimit: Number(req.body.defaultLimit ?? store.getSettings().defaultLimit),
     forecastIntervalSeconds: Number(req.body.forecastIntervalSeconds ?? store.getSettings().forecastIntervalSeconds),
@@ -311,7 +395,7 @@ app.get("/api/health", (_req, res) => {
   res.json({ ok: true, websocketClients: wss.clients.size, services: servicesSnapshot() });
 });
 
-app.post("/api/reset", (_req, res) => {
+app.post("/api/reset", authMiddleware, requireAdmin, (req, res) => {
   if (rampTimer) clearInterval(rampTimer);
   rampTimer = null;
   rampLevel = 0;
@@ -343,7 +427,7 @@ app.get("/gateway/:service/*?", async (req, res) => {
   res.status(result.status).json(result.body);
 });
 
-app.post("/chaos/ramp", (req, res) => {
+app.post("/chaos/ramp", authMiddleware, requireAdmin, (req, res) => {
   const apiKey = String(req.body.apiKey ?? "acme");
   const service = String(req.body.service ?? "orders") as ServiceName;
   if (!SERVICES.includes(service)) {
@@ -365,7 +449,7 @@ app.post("/chaos/ramp", (req, res) => {
   res.json({ ok: true, apiKey, service });
 });
 
-app.post("/chaos/stop", (_req, res) => {
+app.post("/chaos/stop", authMiddleware, requireAdmin, (_req, res) => {
   if (rampTimer) clearInterval(rampTimer);
   rampTimer = null;
   rampLevel = 0;
@@ -375,7 +459,7 @@ app.post("/chaos/stop", (_req, res) => {
   res.json({ ok: true });
 });
 
-app.post("/chaos/incident", (req, res) => {
+app.post("/chaos/incident", authMiddleware, requireAdmin, (req, res) => {
   const service = String(req.body.service ?? "orders") as ServiceName;
   if (!SERVICES.includes(service)) {
     res.status(400).json({ error: "Unknown service" });
@@ -387,7 +471,7 @@ app.post("/chaos/incident", (req, res) => {
   res.json({ ok: true, incidentActive, service });
 });
 
-app.post("/chaos/latency", (req, res) => {
+app.post("/chaos/latency", authMiddleware, requireAdmin, (req, res) => {
   const service = String(req.body.service ?? "orders") as ServiceName;
   if (!SERVICES.includes(service)) {
     res.status(400).json({ error: "Unknown service" });
@@ -398,7 +482,7 @@ app.post("/chaos/latency", (req, res) => {
   res.json({ ok: true, highLatencyActive, service });
 });
 
-app.post("/chaos/ddos", (req, res) => {
+app.post("/chaos/ddos", authMiddleware, requireAdmin, (req, res) => {
   const apiKey = String(req.body.apiKey ?? "acme");
   const service = String(req.body.service ?? "payments") as ServiceName;
   if (!SERVICES.includes(service)) {
@@ -411,7 +495,7 @@ app.post("/chaos/ddos", (req, res) => {
   res.json({ ok: true, requests: 180, service, apiKey });
 });
 
-app.post("/chaos/pulse", async (req, res) => {
+app.post("/chaos/pulse", authMiddleware, requireAdmin, async (req, res) => {
   const apiKey = String(req.body.apiKey ?? CLIENTS[Math.floor(Math.random() * CLIENTS.length)]);
   const service = String(req.body.service ?? SERVICES[Math.floor(Math.random() * SERVICES.length)]) as ServiceName;
   const result = await gatewayRequest(apiKey, service, { endpoint: `/gateway/${service}/pulse`, method: "POST" });

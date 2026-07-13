@@ -192,7 +192,7 @@ export class GatewayStore {
     return entry;
   }
 
-  queryLogs(filters: { q?: string; status?: string; service?: string; apiKey?: string; page?: number; pageSize?: number }) {
+  queryLogs(filters: { q?: string; status?: string; service?: string; apiKey?: string; page?: number; pageSize?: number; allowedApiKeys?: string[] }) {
     const page = Math.max(1, filters.page ?? 1);
     const pageSize = Math.min(100, Math.max(10, filters.pageSize ?? 50));
     const q = filters.q?.toLowerCase().trim();
@@ -200,6 +200,7 @@ export class GatewayStore {
       if (filters.status && String(log.status) !== filters.status) return false;
       if (filters.service && log.service !== filters.service) return false;
       if (filters.apiKey && log.apiKey !== filters.apiKey) return false;
+      if (filters.allowedApiKeys && !filters.allowedApiKeys.includes(log.apiKey)) return false;
       if (!q) return true;
       return [log.apiKey, log.client, log.endpoint, log.method, log.service, String(log.status)].some((value) =>
         value.toLowerCase().includes(q)
@@ -306,8 +307,10 @@ export class GatewayStore {
     return this.incidents;
   }
 
-  analytics(): AnalyticsSummary {
-    const logs = this.requestLog;
+  analytics(allowedApiKeys?: string[]): AnalyticsSummary {
+    const logs = allowedApiKeys
+      ? this.requestLog.filter((log) => allowedApiKeys.includes(log.apiKey))
+      : this.requestLog;
     const totalRequests = logs.length;
     const successes = logs.filter((log) => log.status < 400).length;
     const serviceRows = new Map<ServiceName, { service: ServiceName; requests: number; errors: number }>();
@@ -344,9 +347,12 @@ export class GatewayStore {
     };
   }
 
-  csvLogs() {
+  csvLogs(allowedApiKeys?: string[]) {
     const header = "timestamp,client,apiKey,method,endpoint,service,status,latencyMs,ip";
-    const rows = this.requestLog.map((log) =>
+    const filteredLogs = allowedApiKeys
+      ? this.requestLog.filter((log) => allowedApiKeys.includes(log.apiKey))
+      : this.requestLog;
+    const rows = filteredLogs.map((log) =>
       [
         new Date(log.timestamp).toISOString(),
         log.client,

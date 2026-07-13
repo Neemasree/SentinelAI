@@ -34,6 +34,7 @@ import {
 } from "recharts";
 import type {
   AnalyticsSummary,
+  ApiKeyRecord,
   DashboardSnapshot,
   ForecastRecord,
   GatewaySettings,
@@ -44,6 +45,7 @@ import type {
   ServiceName,
   SocketEvent
 } from "../shared/types";
+import { useAuth } from "./AuthContext";
 
 type Page = "overview" | "keys" | "logs" | "predictions" | "incidents" | "chaos" | "settings" | "analytics";
 
@@ -100,29 +102,49 @@ const stateLabel = {
 };
 
 export function App() {
+  const { token, user } = useAuth();
   const [snapshot, setSnapshot] = useState<DashboardSnapshot>(emptySnapshot);
   const [page, setPage] = useState<Page>("overview");
   const [selectedService, setSelectedService] = useState<ServiceName>("orders");
   const [logQuery, setLogQuery] = useState("");
 
   useEffect(() => {
-    fetch("/api/snapshot")
+    fetch("/api/snapshot", { headers: authHeaders(token) })
       .then((res) => res.json())
       .then(setSnapshot)
       .catch(() => undefined);
+  }, [token]);
 
+  useEffect(() => {
     const protocol = window.location.protocol === "https:" ? "wss" : "ws";
     const socket = new WebSocket(`${protocol}://${window.location.hostname}:4000`);
 
     socket.onmessage = (message) => {
-      const event = JSON.parse(message.data) as SocketEvent;
-      setSnapshot((current) => reduceSocketEvent(current, event));
+      try {
+        const event = JSON.parse(message.data) as SocketEvent;
+        setSnapshot((current) => reduceSocketEvent(current, event));
+      } catch {}
     };
 
-    return () => {
-      if (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CONNECTING) socket.close();
-    };
+    return () => socket.close();
   }, []);
+
+  const filteredNavItems = useMemo(() => {
+    const isAdmin = user?.role === "ADMIN";
+    return navItems.filter((item) => {
+      if (item.page === "chaos" || item.page === "settings") {
+        return isAdmin;
+      }
+      return true;
+    });
+  }, [user]);
+
+  useEffect(() => {
+    const isAdmin = user?.role === "ADMIN";
+    if (user && !isAdmin && (page === "chaos" || page === "settings")) {
+      setPage("overview");
+    }
+  }, [page, user]);
 
   const selectedSeries = useMemo(() => {
     const entries = Object.entries(snapshot.rateSeries).filter(([key]) => key.endsWith(`:${selectedService}`));
@@ -148,7 +170,7 @@ export function App() {
           </div>
         </div>
         <nav>
-          {navItems.map((item) => (
+          {filteredNavItems.map((item) => (
             <button className={page === item.page ? "active" : ""} key={item.page} onClick={() => setPage(item.page)} type="button">
               {item.icon}
               {item.label}
@@ -164,10 +186,12 @@ export function App() {
             <h2>{navItems.find((item) => item.page === page)?.label}</h2>
           </div>
           <div className="topActions">
-            <button className="ghostButton" onClick={() => postJson("/api/reset", {})} type="button">
-              <Square size={16} />
-              Reset demo
-            </button>
+            {user?.role === "ADMIN" && (
+              <button className="ghostButton" onClick={() => postJson("/api/reset", {}, "POST", token)} type="button">
+                <Square size={16} />
+                Reset demo
+              </button>
+            )}
             <div className="livePill">
               <RadioTower size={16} />
               live websocket
@@ -178,12 +202,12 @@ export function App() {
         {page === "overview" && (
           <OverviewPage snapshot={snapshot} selectedService={selectedService} setSelectedService={setSelectedService} selectedSeries={selectedSeries} />
         )}
-        {page === "keys" && <KeysPage snapshot={snapshot} />}
-        {page === "logs" && <LogsPage logs={logs} logQuery={logQuery} setLogQuery={setLogQuery} />}
+        {page === "keys" && <KeysPage token={token} />}
+        {page === "logs" && <LogsPage logs={logs} logQuery={logQuery} setLogQuery={setLogQuery} token={token} />}
         {page === "predictions" && <PredictionsPage forecasts={snapshot.forecasts} selectedSeries={selectedSeries} />}
         {page === "incidents" && <IncidentsPage adjustments={snapshot.adjustments} incidents={snapshot.incidents} />}
-        {page === "chaos" && <ChaosPage snapshot={snapshot} />}
-        {page === "settings" && <SettingsPage settings={snapshot.settings} />}
+        {page === "chaos" && <ChaosPage snapshot={snapshot} token={token} />}
+        {page === "settings" && <SettingsPage settings={snapshot.settings} token={token} />}
         {page === "analytics" && <AnalyticsPage analytics={snapshot.analytics} />}
       </section>
     </main>
@@ -249,14 +273,50 @@ function OverviewPage({
   );
 }
 
-function KeysPage({ snapshot }: { snapshot: DashboardSnapshot }) {
+function KeysPage({ token }: { token: string | null }) {
   const [name, setName] = useState("New Interview Client");
+  const [keys, setKeys] = useState<ApiKeyRecord[]>([]);
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    void refreshKeys();
+  }, [token]);
+
+  async function refreshKeys() {
+    setLoading(true);
+    try {
+      const response = await fetch("/api-keys", { headers: authHeaders(token) });
+      if (response.ok) {
+        const data = (await response.json()) as ApiKeyRecord[];
+        setKeys(data);
+      }
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function createKey() {
+    if (!name.trim()) return;
+    await postJson("/api-keys", { name: name.trim() }, "POST", token);
+    setName("");
+    await refreshKeys();
+  }
+
+  async function toggleKey(id: string, enabled: boolean) {
+    await postJson(`/api-keys/${id}`, { enabled: !enabled }, "PATCH", token);
+    await refreshKeys();
+  }
+
+  async function deleteKey(id: string) {
+    await postJson(`/api-keys/${id}`, {}, "DELETE", token);
+    await refreshKeys();
+  }
 
   return (
     <div className="pageGrid">
       <section className="panel actionRow">
         <input value={name} onChange={(event) => setName(event.target.value)} aria-label="API key name" />
-        <button className="primaryButton" onClick={() => postJson("/api/keys", { name })} type="button">
+        <button className="primaryButton" onClick={() => void createKey()} type="button">
           <KeyRound size={18} />
           Create key
         </button>
@@ -276,7 +336,11 @@ function KeysPage({ snapshot }: { snapshot: DashboardSnapshot }) {
             </tr>
           </thead>
           <tbody>
-            {snapshot.apiKeys.map((key) => (
+            {loading ? (
+              <tr>
+                <td colSpan={8}>Loading API keys...</td>
+              </tr>
+            ) : keys.map((key) => (
               <tr key={key.id}>
                 <td>{key.name}</td>
                 <td><code>{key.key}</code></td>
@@ -285,12 +349,12 @@ function KeysPage({ snapshot }: { snapshot: DashboardSnapshot }) {
                 <td>{key.remainingTokens}</td>
                 <td>{key.usageCount}</td>
                 <td>
-                  <button className="tinyButton" onClick={() => postJson(`/api/keys/${key.id}`, { enabled: !key.enabled }, "PATCH")} type="button">
+                  <button className="tinyButton" onClick={() => void toggleKey(key.id, key.enabled)} type="button">
                     {key.enabled ? "Enabled" : "Disabled"}
                   </button>
                 </td>
                 <td>
-                  <button className="tinyButton danger" onClick={() => postJson(`/api/keys/${key.id}`, {}, "DELETE")} type="button">
+                  <button className="tinyButton danger" onClick={() => void deleteKey(key.id)} type="button">
                     Delete
                   </button>
                 </td>
@@ -303,13 +367,13 @@ function KeysPage({ snapshot }: { snapshot: DashboardSnapshot }) {
   );
 }
 
-function LogsPage({ logs, logQuery, setLogQuery }: { logs: RequestLog[]; logQuery: string; setLogQuery: (query: string) => void }) {
+function LogsPage({ logs, logQuery, setLogQuery, token }: { logs: RequestLog[]; logQuery: string; setLogQuery: (query: string) => void; token: string | null }) {
   return (
     <div className="pageGrid">
       <section className="panel actionRow">
         <Search size={18} />
         <input placeholder="Search method, status, client, endpoint..." value={logQuery} onChange={(event) => setLogQuery(event.target.value)} />
-        <a className="primaryButton" href="/api/logs.csv">
+        <a className="primaryButton" href={token ? `/api/logs.csv?token=${encodeURIComponent(token)}` : "/api/logs.csv"}>
           <Download size={18} />
           Export CSV
         </a>
@@ -396,7 +460,7 @@ function IncidentsPage({ adjustments, incidents }: { adjustments: PredictiveAdju
   );
 }
 
-function ChaosPage({ snapshot }: { snapshot: DashboardSnapshot }) {
+function ChaosPage({ snapshot, token }: { snapshot: DashboardSnapshot; token: string | null }) {
   return (
     <div className="pageGrid">
       <section className="metricStrip">
@@ -405,17 +469,17 @@ function ChaosPage({ snapshot }: { snapshot: DashboardSnapshot }) {
         <Metric icon={<Terminal size={18} />} label="Demo client" value="acme" />
       </section>
       <section className="chaosGrid">
-        <ChaosButton icon={<Flame />} title="Traffic Spike" text="Ramps synthetic traffic until the forecast line bends." path="/chaos/ramp" />
-        <ChaosButton icon={<Zap />} title="DDoS Burst" text="Fires a short burst to force 429s and log filtering." path="/chaos/ddos" />
-        <ChaosButton icon={<AlertTriangle />} title="Crash Service" text="Toggles downstream failures so the circuit opens." path="/chaos/incident" />
-        <ChaosButton icon={<Gauge />} title="High Latency" text="Adds service latency for latency-heavy logs." path="/chaos/latency" />
-        <ChaosButton icon={<Square />} title="Recover" text="Stops traffic ramp and clears active chaos modes." path="/chaos/stop" />
+        <ChaosButton icon={<Flame />} title="Traffic Spike" text="Ramps synthetic traffic until the forecast line bends." path="/chaos/ramp" token={token} />
+        <ChaosButton icon={<Zap />} title="DDoS Burst" text="Fires a short burst to force 429s and log filtering." path="/chaos/ddos" token={token} />
+        <ChaosButton icon={<AlertTriangle />} title="Crash Service" text="Toggles downstream failures so the circuit opens." path="/chaos/incident" token={token} />
+        <ChaosButton icon={<Gauge />} title="High Latency" text="Adds service latency for latency-heavy logs." path="/chaos/latency" token={token} />
+        <ChaosButton icon={<Square />} title="Recover" text="Stops traffic ramp and clears active chaos modes." path="/chaos/stop" token={token} />
       </section>
     </div>
   );
 }
 
-function SettingsPage({ settings }: { settings: GatewaySettings }) {
+function SettingsPage({ settings, token }: { settings: GatewaySettings; token: string | null }) {
   const [draft, setDraft] = useState(settings);
 
   useEffect(() => setDraft(settings), [settings]);
@@ -433,7 +497,7 @@ function SettingsPage({ settings }: { settings: GatewaySettings }) {
           />
         </label>
       ))}
-      <button className="primaryButton" onClick={() => postJson("/api/settings", draft, "PATCH")} type="button">
+      <button className="primaryButton" onClick={() => postJson("/api/settings", draft, "PATCH", token)} type="button">
         <Settings size={18} />
         Save settings
       </button>
@@ -614,9 +678,9 @@ function IncidentItem({ item }: { item: Incident }) {
   );
 }
 
-function ChaosButton({ icon, title, text, path }: { icon: ReactNode; title: string; text: string; path: string }) {
+function ChaosButton({ icon, title, text, path, token }: { icon: ReactNode; title: string; text: string; path: string; token: string | null }) {
   return (
-    <button className="chaosButton" onClick={() => postJson(path, { service: "orders", apiKey: "acme" })} type="button">
+    <button className="chaosButton" onClick={() => postJson(path, { service: "orders", apiKey: "acme" }, "POST", token)} type="button">
       {icon}
       <span>
         <strong>{title}</strong>
@@ -642,10 +706,17 @@ function labelize(value: string) {
   return value.replace(/([A-Z])/g, " $1").replace(/^./, (char) => char.toUpperCase());
 }
 
-function postJson(path: string, body: unknown, method = "POST") {
-  void fetch(path, {
+function authHeaders(token?: string | null) {
+  return {
+    "Content-Type": "application/json",
+    ...(token ? { Authorization: `Bearer ${token}` } : {})
+  };
+}
+
+function postJson(path: string, body: unknown, method = "POST", token?: string | null) {
+  return fetch(path, {
     method,
-    headers: { "Content-Type": "application/json" },
+    headers: authHeaders(token),
     body: JSON.stringify(body)
   });
 }

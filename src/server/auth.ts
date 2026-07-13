@@ -1,5 +1,5 @@
 import bcryptjs from "bcryptjs";
-import * as jwt from "jsonwebtoken";
+import jwt from "jsonwebtoken";
 import type { User } from "@prisma/client";
 
 const JWT_SECRET = process.env.JWT_SECRET || "dev-secret-key";
