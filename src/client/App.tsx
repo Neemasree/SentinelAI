@@ -147,7 +147,7 @@ export function App() {
     if (user && !isAdmin && (page === "chaos" || page === "settings")) {
       setPage("overview");
     }
-  }, [page, user]);
+  }, [user]);
 
   const selectedSeries = useMemo(() => {
     const entries = Object.entries(snapshot.rateSeries).filter(([key]) => key.endsWith(`:${selectedService}`));
@@ -385,12 +385,24 @@ function LogsPage({ token }: { token: string | null }) {
       .then((data) => setLogs(data.rows ?? []))
       .catch(() => undefined);
   }, [logQuery, token]);
+
+  async function downloadCsv() {
+    const res = await fetch("/api/logs.csv", { headers: authHeaders(token) });
+    if (!res.ok) return;
+    const blob = await res.blob();
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = "gateway-logs.csv";
+    a.click();
+    URL.revokeObjectURL(url);
+  }
   return (
     <div className="pageGrid">
       <section className="panel actionRow">
         <Search size={18} />
         <input placeholder="Search method, status, client, endpoint..." value={logQuery} onChange={(event) => setLogQuery(event.target.value)} />
-        <a className="primaryButton" href={token ? `/api/logs.csv?token=${encodeURIComponent(token)}` : "/api/logs.csv"}>
+        <a className="primaryButton" onClick={(e) => { e.preventDefault(); void downloadCsv(); }} href="#">
           <Download size={18} />
           Export CSV
         </a>
@@ -730,7 +742,27 @@ function authHeaders(token?: string | null) {
   };
 }
 
+const ALLOWED_PATHS = new Set([
+  "/api/reset",
+  "/api/keys",
+  "/api-keys",
+  "/api/settings",
+  "/chaos/ramp",
+  "/chaos/ddos",
+  "/chaos/incident",
+  "/chaos/latency",
+  "/chaos/stop"
+]);
+
+function isSafePath(path: string): boolean {
+  if (ALLOWED_PATHS.has(path)) return true;
+  // allow /api/keys/:id and /api-keys/:id
+  if (/^\/api(-keys|\/keys)\/[\w-]+$/.test(path)) return true;
+  return false;
+}
+
 function postJson(path: string, body: unknown, method = "POST", token?: string | null) {
+  if (!isSafePath(path)) throw new Error(`Blocked request to disallowed path: ${path}`);
   return fetch(path, {
     method,
     headers: authHeaders(token),

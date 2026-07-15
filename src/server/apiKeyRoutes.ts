@@ -2,6 +2,8 @@ import express from "express";
 import type { Request, Response } from "express";
 import { db } from "./db";
 import { authMiddleware } from "./middleware/auth";
+import { csrfMiddleware } from "./middleware/csrf";
+import { validateApiKeyCreation } from "./middleware/validation";
 import type { ApiKeyRecord } from "../shared/types";
 import crypto from "crypto";
 
@@ -16,7 +18,9 @@ function maskKey(key: string): string {
   return key.length > 12 ? `${key.slice(0, 8)}...${key.slice(-4)}` : key;
 }
 
-function keyToRecord(key: any, showFull = false): ApiKeyRecord {
+type PrismaApiKey = { id: string; name: string; key: string; enabled: boolean; createdAt: Date; lastUsedAt?: Date | null; usageCount: number; currentLimit: number; remainingTokens: number };
+
+function keyToRecord(key: PrismaApiKey, showFull = false): ApiKeyRecord {
   return {
     id: key.id,
     name: key.name,
@@ -42,7 +46,7 @@ router.get("/", authMiddleware, async (req: Request, res: Response) => {
       where: { userId: req.user.userId }
     });
 
-    return res.json(keys.map(keyToRecord));
+    return res.json(keys.map((k) => keyToRecord(k)));
   } catch (error) {
     console.error("List API keys error:", error);
     return res.status(500).json({ error: "Failed to list API keys" });
@@ -50,7 +54,7 @@ router.get("/", authMiddleware, async (req: Request, res: Response) => {
 });
 
 // Create API key
-router.post("/", authMiddleware, async (req: Request, res: Response) => {
+router.post("/", authMiddleware, csrfMiddleware, validateApiKeyCreation, async (req: Request, res: Response) => {
   try {
     if (!req.user) {
       return res.status(401).json({ error: "Not authenticated" });
@@ -105,7 +109,7 @@ router.get("/:id", authMiddleware, async (req: Request, res: Response) => {
 });
 
 // Update API key
-router.patch("/:id", authMiddleware, async (req: Request, res: Response) => {
+router.patch("/:id", authMiddleware, csrfMiddleware, async (req: Request, res: Response) => {
   try {
     if (!req.user) {
       return res.status(401).json({ error: "Not authenticated" });
@@ -126,6 +130,10 @@ router.patch("/:id", authMiddleware, async (req: Request, res: Response) => {
 
     const { name, enabled, currentLimit } = req.body;
 
+    if (currentLimit !== undefined && (typeof currentLimit !== "number" || currentLimit < 1 || currentLimit > 10000)) {
+      return res.status(400).json({ error: "currentLimit must be a number between 1 and 10000" });
+    }
+
     const updated = await db.apiKey.update({
       where: { id: String(req.params.id) },
       data: {
@@ -143,7 +151,7 @@ router.patch("/:id", authMiddleware, async (req: Request, res: Response) => {
 });
 
 // Delete API key
-router.delete("/:id", authMiddleware, async (req: Request, res: Response) => {
+router.delete("/:id", authMiddleware, csrfMiddleware, async (req: Request, res: Response) => {
   try {
     if (!req.user) {
       return res.status(401).json({ error: "Not authenticated" });

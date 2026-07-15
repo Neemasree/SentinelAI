@@ -3,11 +3,12 @@ import type { Request, Response } from "express";
 import { db } from "./db";
 import { comparePasswords, createToken, hashPassword } from "./auth";
 import { authMiddleware } from "./middleware/auth";
-import type { UserRecord, LoginRequest, RegisterRequest } from "../shared/types";
+import { csrfMiddleware } from "./middleware/csrf";
+import { validateRegistration, validateLogin } from "./middleware/validation";
+import type { UserRecord, LoginRequest, RegisterRequest, UserRole } from "../shared/types";
 
 const router = express.Router();
 
-// Simple in-memory login rate limiter
 const loginAttempts = new Map<string, { count: number; resetAt: number }>();
 function checkLoginRateLimit(ip: string): boolean {
   const now = Date.now();
@@ -21,7 +22,9 @@ function checkLoginRateLimit(ip: string): boolean {
   return true;
 }
 
-function userToRecord(user: any): UserRecord {
+type PrismaUser = { id: string; email: string; name: string; role: UserRole; enabled: boolean; createdAt: Date; updatedAt: Date };
+
+function userToRecord(user: PrismaUser): UserRecord {
   return {
     id: user.id,
     email: user.email,
@@ -33,8 +36,7 @@ function userToRecord(user: any): UserRecord {
   };
 }
 
-// Register
-router.post("/register", async (req: Request<{}, {}, RegisterRequest>, res: Response) => {
+router.post("/register", validateRegistration, async (req: Request<{}, {}, RegisterRequest>, res: Response) => {
   try {
     const { email, password, name } = req.body;
 
@@ -42,40 +44,34 @@ router.post("/register", async (req: Request<{}, {}, RegisterRequest>, res: Resp
       return res.status(400).json({ error: "Missing required fields: email, password, name" });
     }
 
-    // Check if user already exists
+    const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+    if (!emailRegex.test(email)) {
+      return res.status(400).json({ error: "Invalid email format" });
+    }
+
+    if (password.length < 8) {
+      return res.status(400).json({ error: "Password must be at least 8 characters" });
+    }
+
     const existingUser = await db.user.findUnique({ where: { email } });
     if (existingUser) {
       return res.status(409).json({ error: "User already exists" });
     }
 
-    // Hash password
     const hashedPassword = await hashPassword(password);
-
-    // Create user
     const user = await db.user.create({
-      data: {
-        email,
-        name,
-        password: hashedPassword,
-        role: "DEVELOPER"
-      }
+      data: { email, name, password: hashedPassword, role: "DEVELOPER" }
     });
 
-    // Create JWT token
     const token = createToken(user);
-
-    return res.status(201).json({
-      token,
-      user: userToRecord(user)
-    });
+    return res.status(201).json({ token, user: userToRecord(user) });
   } catch (error) {
     console.error("Register error:", error);
     return res.status(500).json({ error: "Failed to register user" });
   }
 });
 
-// Login
-router.post("/login", async (req: Request<{}, {}, LoginRequest>, res: Response) => {
+router.post("/login", validateLogin, async (req: Request<{}, {}, LoginRequest>, res: Response) => {
   try {
     const { email, password } = req.body;
 
@@ -88,7 +84,6 @@ router.post("/login", async (req: Request<{}, {}, LoginRequest>, res: Response) 
       return res.status(429).json({ error: "Too many login attempts. Try again in a minute." });
     }
 
-    // Find user
     const user = await db.user.findUnique({ where: { email } });
     if (!user) {
       return res.status(401).json({ error: "Invalid email or password" });
@@ -98,26 +93,19 @@ router.post("/login", async (req: Request<{}, {}, LoginRequest>, res: Response) 
       return res.status(401).json({ error: "User account is disabled" });
     }
 
-    // Compare password
     const isValid = await comparePasswords(password, user.password);
     if (!isValid) {
       return res.status(401).json({ error: "Invalid email or password" });
     }
 
-    // Create JWT token
     const token = createToken(user);
-
-    return res.json({
-      token,
-      user: userToRecord(user)
-    });
+    return res.json({ token, user: userToRecord(user) });
   } catch (error) {
     console.error("Login error:", error);
     return res.status(500).json({ error: "Failed to login" });
   }
 });
 
-// Get current user
 router.get("/me", authMiddleware, async (req: Request, res: Response) => {
   try {
     if (!req.user) {
@@ -136,15 +124,13 @@ router.get("/me", authMiddleware, async (req: Request, res: Response) => {
   }
 });
 
-// Update user profile
-router.patch("/me", authMiddleware, async (req: Request, res: Response) => {
+router.patch("/me", authMiddleware, csrfMiddleware, async (req: Request, res: Response) => {
   try {
     if (!req.user) {
       return res.status(401).json({ error: "Not authenticated" });
     }
 
     const { name } = req.body;
-
     if (!name) {
       return res.status(400).json({ error: "Name is required" });
     }
@@ -161,15 +147,13 @@ router.patch("/me", authMiddleware, async (req: Request, res: Response) => {
   }
 });
 
-// Change password
-router.post("/change-password", authMiddleware, async (req: Request, res: Response) => {
+router.post("/change-password", authMiddleware, csrfMiddleware, async (req: Request, res: Response) => {
   try {
     if (!req.user) {
       return res.status(401).json({ error: "Not authenticated" });
     }
 
     const { oldPassword, newPassword } = req.body;
-
     if (!oldPassword || !newPassword) {
       return res.status(400).json({ error: "Missing oldPassword or newPassword" });
     }
@@ -179,16 +163,12 @@ router.post("/change-password", authMiddleware, async (req: Request, res: Respon
       return res.status(404).json({ error: "User not found" });
     }
 
-    // Verify old password
     const isValid = await comparePasswords(oldPassword, user.password);
     if (!isValid) {
       return res.status(401).json({ error: "Invalid password" });
     }
 
-    // Hash new password
     const hashedPassword = await hashPassword(newPassword);
-
-    // Update user
     await db.user.update({
       where: { id: req.user.userId },
       data: { password: hashedPassword }

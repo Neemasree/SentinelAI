@@ -1,6 +1,7 @@
 import "dotenv/config";
 import cors from "cors";
 import express from "express";
+import { securityConfig, validateEnvironment } from "./securityConfig";
 import http from "node:http";
 import { WebSocketServer } from "ws";
 import type { ApiKeyRecord, DashboardSnapshot, Incident, RequestLog, ServiceName, ServiceStatus, SocketEvent } from "../shared/types";
@@ -10,9 +11,20 @@ import { Forecaster } from "./forecaster";
 import { GatewayStore } from "./stores";
 import { DatabaseGatewayStore } from "./dbStore";
 import { authMiddleware, optionalAuthMiddleware, requireAdmin } from "./middleware/auth";
+import { csrfMiddleware } from "./middleware/csrf";
+import { securityHeadersMiddleware } from "./middleware/securityHeaders";
+import { rateLimitMiddleware, authRateLimitMiddleware } from "./middleware/rateLimit";
+import { validateSettingsUpdate } from "./middleware/validation";
 import authRoutes from "./authRoutes";
 import apiKeyRoutes from "./apiKeyRoutes";
 import * as client from "prom-client";
+
+// Validate environment variables
+const missingEnvVars = validateEnvironment();
+if (missingEnvVars.length > 0) {
+  console.error("Missing required environment variables:", missingEnvVars);
+  process.exit(1);
+}
 
 const PORT = Number(process.env.PORT ?? 4000);
 const SERVICES: ServiceName[] = ["orders", "billing", "inventory", "users", "payments"];
@@ -30,7 +42,7 @@ let rampLevel = 0;
 let incidentActive = false;
 let incidentService: ServiceName = "orders";
 let highLatencyActive = false;
-let backgroundTimer: ReturnType<typeof setInterval> | null = null;
+let rampInflight = 0;
 
 // Prometheus metrics
 client.collectDefaultMetrics();
@@ -56,9 +68,34 @@ app.get("/metrics", async (_req, res) => {
   }
 });
 
-app.use(cors());
+app.set("trust proxy", 1);
+app.use(securityHeadersMiddleware);
+
+// Handle CORS preflight early, before any auth/CSRF/rate-limit middleware.
+app.options("*", cors({
+  origin: securityConfig.cors.allowedOrigins,
+  methods: securityConfig.cors.allowedMethods,
+  allowedHeaders: securityConfig.cors.allowedHeaders,
+  exposedHeaders: securityConfig.cors.exposedHeaders,
+  maxAge: securityConfig.cors.maxAge,
+  credentials: securityConfig.cors.credentials
+}));
+
+app.use(cors({
+  origin: securityConfig.cors.allowedOrigins,
+  methods: securityConfig.cors.allowedMethods,
+  allowedHeaders: securityConfig.cors.allowedHeaders,
+  exposedHeaders: securityConfig.cors.exposedHeaders,
+  maxAge: securityConfig.cors.maxAge,
+  credentials: securityConfig.cors.credentials
+}));
+
 app.use(express.json());
-app.use("/auth", authRoutes);
+
+
+
+app.use(rateLimitMiddleware());
+app.use("/auth", authRateLimitMiddleware, authRoutes);
 app.use("/api-keys", apiKeyRoutes);
 
 function broadcast(event: SocketEvent) {
@@ -248,7 +285,7 @@ app.get("/api/keys", authMiddleware, requireAdmin, (_req, res) => {
   res.json(store.listApiKeys());
 });
 
-app.post("/api/keys", authMiddleware, requireAdmin, (req, res) => {
+app.post("/api/keys", authMiddleware, requireAdmin, csrfMiddleware, (req, res) => {
   const name = String(req.body.name ?? "New Client");
   const role = req.body.role === "admin" ? "admin" : "client";
   const record = store.createApiKey(name, role);
@@ -256,7 +293,7 @@ app.post("/api/keys", authMiddleware, requireAdmin, (req, res) => {
   res.status(201).json(record);
 });
 
-app.patch("/api/keys/:id", authMiddleware, requireAdmin, (req, res) => {
+app.patch("/api/keys/:id", authMiddleware, requireAdmin, csrfMiddleware, (req, res) => {
   const record = store.updateApiKey(String(req.params.id), req.body);
   if (!record) {
     res.status(404).json({ error: "API key not found" });
@@ -266,7 +303,7 @@ app.patch("/api/keys/:id", authMiddleware, requireAdmin, (req, res) => {
   res.json(record);
 });
 
-app.delete("/api/keys/:id", authMiddleware, requireAdmin, (req, res) => {
+app.delete("/api/keys/:id", authMiddleware, requireAdmin, csrfMiddleware, (req, res) => {
   const deleted = store.deleteApiKey(String(req.params.id));
   broadcast({ type: "api-keys", payload: store.listApiKeys() });
   res.status(deleted ? 204 : 404).end();
@@ -309,17 +346,12 @@ app.get("/api/logs", optionalAuthMiddleware, async (req, res) => {
   });
 });
 
-app.get("/api/logs.csv", optionalAuthMiddleware, async (req, res) => {
-  let userPayload = req.user;
-  if (!userPayload && req.query.token) {
-    const { verifyToken } = await import("./auth");
-    const payload = verifyToken(String(req.query.token));
-    if (payload) userPayload = payload;
-  }
+app.get("/api/logs.csv", authMiddleware, async (req, res) => {
+  const userPayload = req.user!;
 
   let allowedApiKeys: string[] | undefined = undefined;
   let dbUserId: string | undefined = undefined;
-  if (userPayload && userPayload.role !== "ADMIN") {
+  if (userPayload.role !== "ADMIN") {
     const { db } = await import("./db");
     const dbKeys = await db.apiKey.findMany({ where: { userId: userPayload.userId }, select: { key: true } });
     allowedApiKeys = dbKeys.map((k) => k.key);
@@ -375,15 +407,15 @@ app.get("/api/settings", optionalAuthMiddleware, (_req, res) => {
   res.json(store.getSettings());
 });
 
-app.patch("/api/settings", authMiddleware, requireAdmin, (req, res) => {
+app.patch("/api/settings", authMiddleware, requireAdmin, csrfMiddleware, validateSettingsUpdate, (req, res) => {
   const settings = store.updateSettings({
-    defaultLimit: Number(req.body.defaultLimit ?? store.getSettings().defaultLimit),
-    forecastIntervalSeconds: Number(req.body.forecastIntervalSeconds ?? store.getSettings().forecastIntervalSeconds),
-    predictionHorizonSeconds: Number(req.body.predictionHorizonSeconds ?? store.getSettings().predictionHorizonSeconds),
-    adjustmentThreshold: Number(req.body.adjustmentThreshold ?? store.getSettings().adjustmentThreshold),
-    adjustmentRatio: Number(req.body.adjustmentRatio ?? store.getSettings().adjustmentRatio),
-    circuitFailureThreshold: Number(req.body.circuitFailureThreshold ?? store.getSettings().circuitFailureThreshold),
-    circuitCooldownSeconds: Number(req.body.circuitCooldownSeconds ?? store.getSettings().circuitCooldownSeconds)
+    defaultLimit: Math.max(1, Math.min(10000, Number(req.body.defaultLimit ?? store.getSettings().defaultLimit))),
+    forecastIntervalSeconds: Math.max(1, Math.min(300, Number(req.body.forecastIntervalSeconds ?? store.getSettings().forecastIntervalSeconds))),
+    predictionHorizonSeconds: Math.max(1, Math.min(300, Number(req.body.predictionHorizonSeconds ?? store.getSettings().predictionHorizonSeconds))),
+    adjustmentThreshold: Math.max(0.1, Math.min(1, Number(req.body.adjustmentThreshold ?? store.getSettings().adjustmentThreshold))),
+    adjustmentRatio: Math.max(0.1, Math.min(1, Number(req.body.adjustmentRatio ?? store.getSettings().adjustmentRatio))),
+    circuitFailureThreshold: Math.max(0.1, Math.min(1, Number(req.body.circuitFailureThreshold ?? store.getSettings().circuitFailureThreshold))),
+    circuitCooldownSeconds: Math.max(1, Math.min(300, Number(req.body.circuitCooldownSeconds ?? store.getSettings().circuitCooldownSeconds)))
   });
   for (const breaker of breakers.values()) {
     breaker.updateOptions(settings.circuitFailureThreshold, settings.circuitCooldownSeconds);
@@ -396,7 +428,7 @@ app.get("/api/health", (_req, res) => {
   res.json({ ok: true, websocketClients: wss.clients.size, services: servicesSnapshot() });
 });
 
-app.post("/api/reset", authMiddleware, requireAdmin, (req, res) => {
+app.post("/api/reset", authMiddleware, requireAdmin, csrfMiddleware, (req, res) => {
   if (rampTimer) clearInterval(rampTimer);
   rampTimer = null;
   rampLevel = 0;
@@ -432,7 +464,7 @@ app.get("/gateway/:service/*?", async (req, res) => {
   res.status(result.status).json(result.body);
 });
 
-app.post("/chaos/ramp", authMiddleware, requireAdmin, (req, res) => {
+app.post("/chaos/ramp", authMiddleware, requireAdmin, csrfMiddleware, (req, res) => {
   const apiKey = String(req.body.apiKey ?? "acme");
   const service = String(req.body.service ?? "orders") as ServiceName;
   if (!SERVICES.includes(service)) {
@@ -444,8 +476,12 @@ app.post("/chaos/ramp", authMiddleware, requireAdmin, (req, res) => {
   rampLevel = 4;
   rampTimer = setInterval(() => {
     rampLevel = Math.min(rampLevel + 2, 32);
-    for (let i = 0; i < rampLevel; i += 1) {
-      void gatewayRequest(apiKey, service, { endpoint: `/gateway/${service}/ramp`, method: "GET", ip: "10.0.0.42" });
+    if (rampInflight < 64) {
+      for (let i = 0; i < rampLevel; i += 1) {
+        rampInflight++;
+        void gatewayRequest(apiKey, service, { endpoint: `/gateway/${service}/ramp`, method: "GET", ip: "10.0.0.42" })
+          .finally(() => { rampInflight--; });
+      }
     }
     broadcast({ type: "services", payload: servicesSnapshot() });
   }, 1000);
@@ -454,7 +490,7 @@ app.post("/chaos/ramp", authMiddleware, requireAdmin, (req, res) => {
   res.json({ ok: true, apiKey, service });
 });
 
-app.post("/chaos/stop", authMiddleware, requireAdmin, (_req, res) => {
+app.post("/chaos/stop", authMiddleware, requireAdmin, csrfMiddleware, (_req, res) => {
   if (rampTimer) clearInterval(rampTimer);
   rampTimer = null;
   rampLevel = 0;
@@ -464,7 +500,7 @@ app.post("/chaos/stop", authMiddleware, requireAdmin, (_req, res) => {
   res.json({ ok: true });
 });
 
-app.post("/chaos/incident", authMiddleware, requireAdmin, (req, res) => {
+app.post("/chaos/incident", authMiddleware, requireAdmin, csrfMiddleware, (req, res) => {
   const service = String(req.body.service ?? "orders") as ServiceName;
   if (!SERVICES.includes(service)) {
     res.status(400).json({ error: "Unknown service" });
@@ -476,7 +512,7 @@ app.post("/chaos/incident", authMiddleware, requireAdmin, (req, res) => {
   res.json({ ok: true, incidentActive, service });
 });
 
-app.post("/chaos/latency", authMiddleware, requireAdmin, (req, res) => {
+app.post("/chaos/latency", authMiddleware, requireAdmin, csrfMiddleware, (req, res) => {
   const service = String(req.body.service ?? "orders") as ServiceName;
   if (!SERVICES.includes(service)) {
     res.status(400).json({ error: "Unknown service" });
@@ -487,7 +523,7 @@ app.post("/chaos/latency", authMiddleware, requireAdmin, (req, res) => {
   res.json({ ok: true, highLatencyActive, service });
 });
 
-app.post("/chaos/ddos", authMiddleware, requireAdmin, (req, res) => {
+app.post("/chaos/ddos", authMiddleware, requireAdmin, csrfMiddleware, (req, res) => {
   const apiKey = String(req.body.apiKey ?? "acme");
   const service = String(req.body.service ?? "payments") as ServiceName;
   if (!SERVICES.includes(service)) {
@@ -500,7 +536,7 @@ app.post("/chaos/ddos", authMiddleware, requireAdmin, (req, res) => {
   res.json({ ok: true, requests: 180, service, apiKey });
 });
 
-app.post("/chaos/pulse", authMiddleware, requireAdmin, async (req, res) => {
+app.post("/chaos/pulse", authMiddleware, requireAdmin, csrfMiddleware, async (req, res) => {
   const apiKey = String(req.body.apiKey ?? CLIENTS[Math.floor(Math.random() * CLIENTS.length)]);
   const service = String(req.body.service ?? SERVICES[Math.floor(Math.random() * SERVICES.length)]) as ServiceName;
   const result = await gatewayRequest(apiKey, service, { endpoint: `/gateway/${service}/pulse`, method: "POST" });
@@ -529,7 +565,7 @@ setInterval(() => {
   }
 }, 30_000);
 
-backgroundTimer = setInterval(() => {
+setInterval(() => {
   const service = SERVICES[Math.floor(Math.random() * SERVICES.length)];
   const apiKey = CLIENTS[Math.floor(Math.random() * CLIENTS.length)];
   void gatewayRequest(apiKey, service, { endpoint: `/gateway/${service}/background`, method: "GET" });

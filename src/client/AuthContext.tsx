@@ -23,10 +23,15 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
 
     if (savedToken && savedUser) {
       try {
-        setToken(savedToken);
-        setUser(JSON.parse(savedUser));
-      } catch (error) {
-        console.error("Failed to restore auth state:", error);
+        const parsed = JSON.parse(savedUser);
+        if (parsed && typeof parsed.id === "string" && typeof parsed.email === "string") {
+          setToken(savedToken);
+          setUser(parsed as UserRecord);
+        } else {
+          localStorage.removeItem("authToken");
+          localStorage.removeItem("user");
+        }
+      } catch {
         localStorage.removeItem("authToken");
         localStorage.removeItem("user");
       }

@@ -35,8 +35,6 @@ export function Login({ onLoginSuccess, onSwitchToRegister }: Props) {
       }
 
       const data = await response.json();
-      localStorage.setItem("authToken", data.token);
-      localStorage.setItem("user", JSON.stringify(data.user));
       onLoginSuccess(data.token, data.user);
     } catch (err) {
       setError(err instanceof Error ? err.message : "Login failed");
@@ -139,9 +137,8 @@ export function Login({ onLoginSuccess, onSwitchToRegister }: Props) {
           </p>
 
           <div className="authDemoCard">
-            <p className="authDemoTitle">Demo Credentials</p>
-            <p>Email: demo@example.com</p>
-            <p>Password: Password123!</p>
+            <p className="authDemoTitle">Demo Access</p>
+            <p>Contact your administrator for demo access credentials.</p>
           </div>
         </div>
       </section>

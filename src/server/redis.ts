@@ -18,7 +18,10 @@ if (process.env.NODE_ENV === "production") {
 }
 
 redis.on("error", (err) => {
-  if (redisState.available) console.warn("Redis unavailable, falling back to in-memory:", err.message);
+  if (redisState.available) {
+    const safe = String(err.message).replace(/[\r\n]/g, " ");
+    console.warn("Redis unavailable, falling back to in-memory:", safe);
+  }
   redisState.available = false;
 });
 

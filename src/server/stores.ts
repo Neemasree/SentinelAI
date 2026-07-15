@@ -139,8 +139,17 @@ export class GatewayStore {
   }
 
   isApiKeyAllowed(apiKey: string) {
-    const record = this.apiKeys.find((key) => key.key === apiKey);
+    const record = this.apiKeys.find((key) => this.timingSafeEqual(key.key, apiKey));
     return record?.enabled === true;
+  }
+
+  private timingSafeEqual(a: string, b: string): boolean {
+    if (a.length !== b.length) return false;
+    let result = 0;
+    for (let i = 0; i < a.length; i++) {
+      result |= a.charCodeAt(i) ^ b.charCodeAt(i);
+    }
+    return result === 0;
   }
 
   getCurrentLimit(apiKey: string) {
@@ -194,7 +203,7 @@ export class GatewayStore {
 
   queryLogs(filters: { q?: string; status?: string; service?: string; apiKey?: string; page?: number; pageSize?: number; allowedApiKeys?: string[] }) {
     const page = Math.max(1, filters.page ?? 1);
-    const pageSize = Math.min(100, Math.max(10, filters.pageSize ?? 50));
+    const pageSize = Math.min(500, Math.max(10, filters.pageSize ?? 50));
     const q = filters.q?.toLowerCase().trim();
     const filtered = this.requestLog.filter((log) => {
       if (filters.status && String(log.status) !== filters.status) return false;
@@ -376,13 +385,13 @@ export class GatewayStore {
 
   private bumpUsage(apiKey: string) {
     this.apiKeys = this.apiKeys.map((record) =>
-      record.key === apiKey ? { ...record, usageCount: record.usageCount + 1, lastUsedAt: Date.now() } : record
+      this.timingSafeEqual(record.key, apiKey) ? { ...record, usageCount: record.usageCount + 1, lastUsedAt: Date.now() } : record
     );
   }
 
   private refreshApiKeyStats(apiKey?: string) {
     this.apiKeys = this.apiKeys.map((record) => {
-      if (apiKey && record.key !== apiKey) return record;
+      if (apiKey && !this.timingSafeEqual(record.key, apiKey)) return record;
       const bucket = this.buckets.get(record.key);
       const currentLimit = this.getCurrentLimit(record.key);
       return {

@@ -8,6 +8,41 @@ type Override = { limit: number; expiresAt: number };
 // In-memory fallback buckets when Redis is unavailable
 const memBuckets = new Map<string, Bucket>();
 
+function parseBucket(raw: string | null, fallback: Bucket): Bucket {
+  try {
+    if (!raw) return fallback;
+    const p = JSON.parse(raw);
+    if (
+      p !== null &&
+      typeof p === "object" &&
+      !Array.isArray(p) &&
+      typeof p.tokens === "number" &&
+      typeof p.lastRefill === "number"
+    ) {
+      return { tokens: p.tokens, lastRefill: p.lastRefill };
+    }
+    return fallback;
+  } catch { return fallback; }
+}
+
+function parseRatePoint(raw: string): RatePoint | null {
+  try {
+    const p = JSON.parse(raw);
+    if (
+      p !== null &&
+      typeof p === "object" &&
+      !Array.isArray(p) &&
+      typeof p.t === "number" &&
+      typeof p.rate === "number" &&
+      (p.forecast === undefined || typeof p.forecast === "number") &&
+      (p.adjusted === undefined || typeof p.adjusted === "boolean")
+    ) {
+      return { t: p.t, rate: p.rate, forecast: p.forecast, adjusted: p.adjusted } as RatePoint;
+    }
+    return null;
+  } catch { return null; }
+}
+
 export class DatabaseGatewayStore {
   private defaultSettings: GatewaySettings = {
     defaultLimit: 70,
@@ -114,9 +149,9 @@ export class DatabaseGatewayStore {
       try {
         const redisKey = `rate:${apiKeyString}`;
         const bucketJson = await redis.get(redisKey);
-        bucket = bucketJson ? JSON.parse(bucketJson) : { tokens: capacity, lastRefill: now };
+        bucket = parseBucket(bucketJson, { tokens: capacity, lastRefill: now });
         const elapsed = (now - bucket.lastRefill) / 1000;
-        bucket.tokens = Math.min(capacity, bucket.tokens + elapsed * (capacity / 60));
+        bucket.tokens = Math.min(capacity, bucket.tokens + elapsed * (capacity / 10));
         bucket.lastRefill = now;
         const allowed = bucket.tokens >= 1;
         if (allowed) bucket.tokens -= 1;
@@ -136,7 +171,7 @@ export class DatabaseGatewayStore {
     // In-memory fallback
     bucket = memBuckets.get(apiKeyString) ?? { tokens: capacity, lastRefill: now };
     const elapsed = (now - bucket.lastRefill) / 1000;
-    bucket.tokens = Math.min(capacity, bucket.tokens + elapsed * (capacity / 60));
+    bucket.tokens = Math.min(capacity, bucket.tokens + elapsed * (capacity / 10));
     bucket.lastRefill = now;
     const allowed = bucket.tokens >= 1;
     if (allowed) bucket.tokens -= 1;
@@ -222,7 +257,7 @@ export class DatabaseGatewayStore {
     try {
       const redisKey = `rate-series:${userId}:${service}`;
       const series = await redis.lrange(redisKey, 0, -1);
-      const points: RatePoint[] = series.map((s) => JSON.parse(s));
+      const points: RatePoint[] = series.map(parseRatePoint).filter((p): p is RatePoint => p !== null);
       points.push(point);
       if (points.length > 100) points.shift();
       await redis.del(redisKey);
@@ -239,7 +274,7 @@ export class DatabaseGatewayStore {
     try {
       const redisKey = `rate-series:${userId}:${service}`;
       const series = await redis.lrange(redisKey, 0, -1);
-      return series.map((s) => JSON.parse(s) as RatePoint);
+      return series.map(parseRatePoint).filter((p): p is RatePoint => p !== null);
     } catch { return []; }
   }
 
