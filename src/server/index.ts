@@ -4,7 +4,7 @@ import express from "express";
 import { securityConfig, validateEnvironment } from "./securityConfig";
 import http from "node:http";
 import { WebSocketServer } from "ws";
-import type { ApiKeyRecord, DashboardSnapshot, Incident, RequestLog, ServiceName, ServiceStatus, SocketEvent } from "../shared/types";
+import type { ApiKeyRecord, DashboardSnapshot, Incident, PredictiveAdjustment, RequestLog, ServiceName, ServiceStatus, SocketEvent } from "../shared/types";
 import { CircuitBreaker } from "./circuitBreaker";
 import { explainIncident, streamText } from "./explanation";
 import { Forecaster } from "./forecaster";
@@ -121,17 +121,21 @@ function snapshot(userApiKeys?: ApiKeyRecord[], rawKeyStrings?: string[]): Dashb
   const keys = userApiKeys ?? store.listApiKeys();
   const keySet = new Set(rawKeyStrings ?? keys.map((key) => key.key));
   const hasKeyFilter = rawKeyStrings !== undefined || userApiKeys !== undefined;
+  
+  // For non-admin users, include demo keys so they can see demo incidents/adjustments
+  const demoKeys = ["acme", "globex", "initech"];
+  const effectiveKeySet = hasKeyFilter ? keySet : new Set([...keySet, ...demoKeys]);
 
   return {
     services: servicesSnapshot(),
     apiKeys: keys,
-    recentLogs: store.recentLogs().filter((log) => !hasKeyFilter || keySet.has(log.apiKey)),
-    forecasts: store.snapshotForecasts().filter((forecast) => !hasKeyFilter || keySet.has(forecast.apiKey)),
+    recentLogs: store.recentLogs().filter((log) => !hasKeyFilter || effectiveKeySet.has(log.apiKey)),
+    forecasts: store.snapshotForecasts().filter((forecast) => !hasKeyFilter || effectiveKeySet.has(forecast.apiKey)),
     settings: store.getSettings(),
     analytics: store.analytics(hasKeyFilter ? [...keySet] : undefined),
-    rateSeries: filterRateSeries(store.snapshotSeries(), keySet, hasKeyFilter),
-    adjustments: store.snapshotAdjustments().filter((adjustment) => !hasKeyFilter || keySet.has(adjustment.apiKey)),
-    incidents: store.snapshotIncidents().filter((incident) => !hasKeyFilter || keySet.has(incident.apiKey)),
+    rateSeries: filterRateSeries(store.snapshotSeries(), effectiveKeySet, true),
+    adjustments: store.snapshotAdjustments().filter((adjustment) => !hasKeyFilter || effectiveKeySet.has(adjustment.apiKey)),
+    incidents: store.snapshotIncidents().filter((incident) => !hasKeyFilter || effectiveKeySet.has(incident.apiKey)),
     chaos: { rampActive: Boolean(rampTimer), incidentActive }
   };
 }
@@ -266,7 +270,7 @@ app.get("/api/snapshot", optionalAuthMiddleware, async (req, res) => {
   const apiKeys: ApiKeyRecord[] = dbKeys.map((key) => ({
     id: key.id,
     name: key.name,
-    key: key.key,
+    key: key.key.length > 12 ? `${key.key.slice(0, 8)}...${key.key.slice(-4)}` : key.key,
     role: "client",
     enabled: key.enabled,
     createdAt: key.createdAt.getTime(),
@@ -275,7 +279,7 @@ app.get("/api/snapshot", optionalAuthMiddleware, async (req, res) => {
     currentLimit: key.currentLimit,
     remainingTokens: key.remainingTokens
   }));
-  const rawKeyStrings = apiKeys.map(k => k.key);
+  const rawKeyStrings = dbKeys.map(k => k.key);
   const data = snapshot(apiKeys, rawKeyStrings);
   userSnapshotCache.set(req.user.userId, { data, expiresAt: Date.now() + 2000 });
   res.json(data);
@@ -319,12 +323,15 @@ app.get("/api/logs", optionalAuthMiddleware, async (req, res) => {
     pageSize: Number(req.query.pageSize ?? 50)
   };
 
-  // Fetch a raw window from both sources (no pagination yet), then merge
+  // For regular users, show logs for their database API keys AND demo keys
+  // For ADMIN users, show all logs (including demo keys)
   let allowedApiKeys: string[] | undefined = undefined;
   if (req.user && req.user.role !== "ADMIN") {
     const { db } = await import("./db");
     const dbKeys = await db.apiKey.findMany({ where: { userId: req.user.userId }, select: { key: true } });
     allowedApiKeys = dbKeys.map((k) => k.key);
+    // Also include demo keys for regular users so they can see demo traffic
+    allowedApiKeys = [...allowedApiKeys, "acme", "globex", "initech"];
   }
   const memResult = store.queryLogs({ ...filters, page: 1, pageSize: 500, allowedApiKeys });
   const dbUserId = req.user?.role !== "ADMIN" ? req.user?.userId : undefined;
@@ -355,6 +362,8 @@ app.get("/api/logs.csv", authMiddleware, async (req, res) => {
     const { db } = await import("./db");
     const dbKeys = await db.apiKey.findMany({ where: { userId: userPayload.userId }, select: { key: true } });
     allowedApiKeys = dbKeys.map((k) => k.key);
+    // Also include demo keys for regular users so they can see demo traffic
+    allowedApiKeys = [...allowedApiKeys, "acme", "globex", "initech"];
     dbUserId = userPayload.userId;
   }
 
@@ -383,6 +392,8 @@ app.get("/api/forecasts", optionalAuthMiddleware, async (req, res) => {
     const { db } = await import("./db");
     const dbKeys = await db.apiKey.findMany({ where: { userId: req.user.userId }, select: { key: true } });
     allowedApiKeys = dbKeys.map((key) => key.key);
+    // Include demo keys for regular users
+    allowedApiKeys = [...allowedApiKeys, "acme", "globex", "initech"];
   }
   const forecasts = store.snapshotForecasts();
   if (allowedApiKeys) {
@@ -399,6 +410,8 @@ app.get("/api/analytics", optionalAuthMiddleware, async (req, res) => {
     const { db } = await import("./db");
     const dbKeys = await db.apiKey.findMany({ where: { userId: req.user.userId }, select: { key: true } });
     allowedApiKeys = dbKeys.map((key) => key.key);
+    // Include demo keys for regular users
+    allowedApiKeys = [...allowedApiKeys, "acme", "globex", "initech"];
   }
   res.json(store.analytics(allowedApiKeys));
 });
@@ -544,7 +557,33 @@ app.post("/chaos/pulse", authMiddleware, requireAdmin, csrfMiddleware, async (re
   res.status(result.status).json(result.body);
 });
 
-wss.on("connection", (socket) => {
+wss.on("connection", (socket, request) => {
+  // Validate Origin header
+  const origin = request.headers.origin;
+  const allowedOrigins = securityConfig.cors.allowedOrigins;
+  if (origin && !allowedOrigins.includes(origin)) {
+    console.warn(`WebSocket connection rejected: invalid origin ${origin}`);
+    socket.close(1008, "Invalid origin");
+    return;
+  }
+  
+  // Extract JWT token from query parameters or headers
+  const url = new URL(request.url || "/", `http://${request.headers.host}`);
+  const token = url.searchParams.get("token") || request.headers["sec-websocket-protocol"];
+  
+  if (token) {
+    // Verify JWT token
+    const { verifyToken } = await import("./auth");
+    const payload = verifyToken(token);
+    if (!payload) {
+      console.warn("WebSocket connection rejected: invalid token");
+      socket.close(1008, "Invalid token");
+      return;
+    }
+    // Store user info on socket for future use if needed
+    (socket as any).user = payload;
+  }
+  
   socket.send(JSON.stringify({ type: "snapshot", payload: snapshot() } satisfies SocketEvent));
 });
 
@@ -570,6 +609,54 @@ setInterval(() => {
   const apiKey = CLIENTS[Math.floor(Math.random() * CLIENTS.length)];
   void gatewayRequest(apiKey, service, { endpoint: `/gateway/${service}/background`, method: "GET" });
 }, 1_200);
+
+// Create some demo incidents and adjustments for all users to see
+function createDemoIncidentsAndAdjustments() {
+  // Demo predictive adjustment
+  const adjustment: PredictiveAdjustment = {
+    id: crypto.randomUUID(),
+    apiKey: "acme",
+    service: "orders",
+    oldLimit: 70,
+    newLimit: 50,
+    predictedRate: 65.2,
+    slope: 0.8,
+    timestamp: Date.now() - 30000,
+    explanation: "Traffic forecast predicts 65.2 req/s in 30s, exceeding 80% of current limit. Proactively reducing limit from 70 to 50 to prevent rate limiting.",
+    streaming: false
+  };
+  store.addAdjustment(adjustment);
+  
+  // Demo incident
+  const incident: Incident = {
+    id: crypto.randomUUID(),
+    apiKey: "globex",
+    service: "payments",
+    failureRate: 0.72,
+    timestamp: Date.now() - 60000,
+    explanation: "Downstream payment service experiencing 72% failure rate. Circuit breaker opened to prevent cascading failures. Retry after 15s cooldown.",
+    streaming: false
+  };
+  store.addIncident(incident);
+  
+  // Another demo adjustment
+  const adjustment2: PredictiveAdjustment = {
+    id: crypto.randomUUID(),
+    apiKey: "initech",
+    service: "billing",
+    oldLimit: 70,
+    newLimit: 60,
+    predictedRate: 58.7,
+    slope: 0.6,
+    timestamp: Date.now() - 90000,
+    explanation: "Billing service shows steady upward trend. Preemptively adjusting limit to maintain healthy headroom.",
+    streaming: false
+  };
+  store.addAdjustment(adjustment2);
+}
+
+// Create demo data on startup
+createDemoIncidentsAndAdjustments();
 
 server.listen(PORT, () => {
   console.log(`Gateway API listening on http://127.0.0.1:${PORT}`);

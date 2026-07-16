@@ -1,6 +1,7 @@
 import { db } from "./db";
 import { redis, redisAvailable } from "./redis";
 import type { ApiKeyRecord, ForecastRecord, Incident, PredictiveAdjustment, RequestLog, ServiceName, GatewaySettings, AnalyticsSummary, RatePoint } from "../shared/types";
+import crypto from "crypto";
 
 type Bucket = { tokens: number; lastRefill: number };
 type Override = { limit: number; expiresAt: number };
@@ -59,10 +60,21 @@ export class DatabaseGatewayStore {
    */
   async isApiKeyAllowed(apiKeyString: string): Promise<boolean> {
     try {
-      const key = await db.apiKey.findUnique({
+      // First try to find by key (for backward compatibility)
+      let key = await db.apiKey.findUnique({
         where: { key: apiKeyString },
         include: { user: true }
       });
+      
+      // If not found by key, try by hash
+      if (!key) {
+        const keyHash = crypto.createHash("sha256").update(apiKeyString).digest("hex");
+        key = await db.apiKey.findUnique({
+          where: { keyHash },
+          include: { user: true }
+        });
+      }
+      
       return key?.enabled && key.user.enabled ? true : false;
     } catch {
       return false;
@@ -130,10 +142,22 @@ export class DatabaseGatewayStore {
    * Get API key with user info
    */
   async getApiKeyWithUser(apiKeyString: string) {
-    return db.apiKey.findUnique({
+    // First try to find by key (for backward compatibility)
+    let key = await db.apiKey.findUnique({
       where: { key: apiKeyString },
       include: { user: true }
     });
+    
+    // If not found by key, try by hash
+    if (!key) {
+      const keyHash = crypto.createHash("sha256").update(apiKeyString).digest("hex");
+      key = await db.apiKey.findUnique({
+        where: { keyHash },
+        include: { user: true }
+      });
+    }
+    
+    return key;
   }
 
   /**
@@ -472,7 +496,7 @@ export class DatabaseGatewayStore {
   }
 
   /**
-   * Get all API keys for user
+   * Get all API keys for user (masked for listing)
    */
   async getUserApiKeys(userId: string): Promise<ApiKeyRecord[]> {
     const keys = await db.apiKey.findMany({
@@ -482,7 +506,7 @@ export class DatabaseGatewayStore {
     return keys.map((key) => ({
       id: key.id,
       name: key.name,
-      key: key.key,
+      key: this.maskKey(key.key),
       role: "client",
       enabled: key.enabled,
       createdAt: key.createdAt.getTime(),
@@ -491,6 +515,11 @@ export class DatabaseGatewayStore {
       currentLimit: key.currentLimit,
       remainingTokens: key.remainingTokens
     }));
+  }
+
+  private maskKey(key: string): string {
+    if (key.length <= 8) return "****";
+    return `${key.slice(0, 4)}...${key.slice(-4)}`;
   }
 
   /**

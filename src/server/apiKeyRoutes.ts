@@ -14,11 +14,16 @@ function generateApiKey(): string {
   return `sk_${crypto.randomBytes(24).toString("hex")}`;
 }
 
+// Hash API key for storage
+function hashApiKey(key: string): string {
+  return crypto.createHash("sha256").update(key).digest("hex");
+}
+
 function maskKey(key: string): string {
   return key.length > 12 ? `${key.slice(0, 8)}...${key.slice(-4)}` : key;
 }
 
-type PrismaApiKey = { id: string; name: string; key: string; enabled: boolean; createdAt: Date; lastUsedAt?: Date | null; usageCount: number; currentLimit: number; remainingTokens: number };
+type PrismaApiKey = { id: string; name: string; key: string; keyHash: string; enabled: boolean; createdAt: Date; lastUsedAt?: Date | null; usageCount: number; currentLimit: number; remainingTokens: number };
 
 function keyToRecord(key: PrismaApiKey, showFull = false): ApiKeyRecord {
   return {
@@ -66,11 +71,15 @@ router.post("/", authMiddleware, csrfMiddleware, validateApiKeyCreation, async (
       return res.status(400).json({ error: "Name is required" });
     }
 
+    const rawKey = generateApiKey();
+    const keyHash = hashApiKey(rawKey);
+    
     const key = await db.apiKey.create({
       data: {
         userId: req.user.userId,
         name,
-        key: generateApiKey()
+        key: rawKey,
+        keyHash
       }
     });
 

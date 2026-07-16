@@ -1,8 +1,9 @@
 # TODO
 
-- [x] Update CORS config parsing + dev fallback
-- [x] Add explicit OPTIONS preflight handling before auth/CSRF middlewares
-- [x] Fix websocket-related CSP `connect-src` to avoid ws failures
-- [ ] Run typecheck and start server
-- [ ] Verification: browser network preflight + websocket connection
+- [x] Locate and confirm CORS configuration and whether it can cause observed issues.
+- [x] Identify the actual cause of `/api-keys` 403: CSRF middleware.
+- [ ] Implement CSRF token flow so frontend includes required CSRF fields/headers for POST/PATCH/DELETE.
+  - Add a CSRF token endpoint on the backend (or reuse existing one if present).
+  - Update frontend to fetch CSRF token and include it in `postJson()` requests to protected routes.
+- [ ] Re-run frontend/backend and verify API key creation works.
 

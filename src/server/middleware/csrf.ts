@@ -13,6 +13,13 @@ function generateToken(): string {
 export function csrfMiddleware(req: Request, res: Response, next: NextFunction) {
   if (SAFE_METHODS.has(req.method)) return next();
   
+  // Skip CSRF for API endpoints that use Bearer token authentication
+  const authHeader = req.headers.authorization;
+  if (authHeader && authHeader.startsWith("Bearer ")) {
+    // API requests with Bearer tokens don't need CSRF protection
+    return next();
+  }
+  
   // Check for X-Requested-With header (for AJAX requests)
   if (req.headers["x-requested-with"] === "XMLHttpRequest") {
     // For AJAX requests, also verify CSRF token

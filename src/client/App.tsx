@@ -117,7 +117,12 @@ export function App() {
 
   useEffect(() => {
     const protocol = window.location.protocol === "https:" ? "wss" : "ws";
-    const socket = new WebSocket(`${protocol}://${window.location.hostname}:4000`);
+    const wsUrl = `${protocol}://${window.location.hostname}:4000`;
+    
+    // Add token to WebSocket connection if available
+    const socket = token 
+      ? new WebSocket(wsUrl, [token])
+      : new WebSocket(wsUrl);
 
     socket.onopen = () => setWsConnected(true);
     socket.onclose = () => setWsConnected(false);
@@ -130,7 +135,7 @@ export function App() {
     };
 
     return () => socket.close();
-  }, []);
+  }, [token]);
 
   const filteredNavItems = useMemo(() => {
     const isAdmin = user?.role === "ADMIN";

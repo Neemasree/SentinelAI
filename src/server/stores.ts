@@ -89,7 +89,16 @@ export class GatewayStore {
 
   listApiKeys() {
     this.refreshApiKeyStats();
-    return this.apiKeys;
+    // Return masked keys for listing
+    return this.apiKeys.map(key => ({
+      ...key,
+      key: this.maskKey(key.key)
+    }));
+  }
+
+  private maskKey(key: string): string {
+    if (key.length <= 8) return "****";
+    return `${key.slice(0, 4)}...${key.slice(-4)}`;
   }
 
   createApiKey(name: string, role: "admin" | "client" = "client") {
